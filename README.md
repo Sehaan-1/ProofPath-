@@ -23,9 +23,16 @@ configured embedding provider. GitHub ingestion fetches public repository data;
 users are responsible for supplying repositories they own.
 
 The API exposes text, file, and GitHub ingestion, evidence search, opportunity
-creation from pasted text, opportunity lookup, and tracker listing under
+creation from pasted text or a safely fetched public URL, opportunity lookup,
+synchronous analysis run and report, and tracker listing under
 `/api/v1`. File uploads require a `canonical_uri` form field and are limited to
 5 MiB. Existing source URIs with changed content return 409 rather than deleting
-chunks that may already be cited. URL-only opportunity fetching is disabled
-until DNS and redirect SSRF protections are in place. Analysis run and report
-endpoints have not yet been implemented.
+chunks that may already be cited. URL fetches reject non-public destinations,
+validate each redirect and pin validated DNS results.
+
+Analysis runs are synchronous; `async_run=true` is not yet supported. Optionally
+provide both timezone-aware `calendar_start` and `calendar_end` in the run
+request to create a calendar draft when a sprint is suggested. Without times, the
+sprint remains in the report and no calendar draft is created. Drafts are never
+executed or approved automatically. Model-backed analysis requires an OpenAI
+API key and sends job descriptions and evidence to the configured provider.

@@ -126,8 +126,8 @@ def build_workflow(
 ) -> BoundedWorkflow:
     """Build a graph tied to one persisted run and thread; no memory fallback.
 
-    Calendar times are optional until a sprint exists, in which case explicit
-    timezone-aware times are required. Invocation enforces a hard recursion limit.
+    Calendar times are optional; if provided they must be timezone-aware.
+    Invocation enforces a hard recursion limit.
     Reopen the saver before rebuilding
     a graph after process restart, with the same run, thread and dependencies.
     """

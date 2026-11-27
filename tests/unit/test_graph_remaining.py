@@ -197,9 +197,10 @@ async def test_drafts_are_replay_safe_and_preserve_tracker(monkeypatch):
             return stored[idempotency_key], False
 
     monkeypatch.setattr("proofpath.graph.nodes.DraftRepo", FakeDraftRepo)
-    with pytest.raises(ValueError, match="Explicit calendar"):
-        await create_action_drafts_node(state, session=session, analysis_run_id=run_id)
-    assert not stored
+    without_calendar = await create_action_drafts_node(
+        state, session=session, analysis_run_id=run_id
+    )
+    assert len(without_calendar["draft_actions"]) == 1
     start = datetime.now(UTC)
     kwargs = {
         "session": session,

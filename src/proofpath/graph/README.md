@@ -14,7 +14,8 @@ saver to resume. `graph.astream` and `graph.aget_state` use the same bound
 thread. The facade enforces synchronous checkpoint writes and a fixed recursion
 limit regardless of caller-provided settings. `step_budget` is capped at 100;
 LangGraph's recursion limit includes additional steps for error handling.
-Calendar start/end must be explicitly supplied when a sprint is generated.
+A calendar draft is created only when explicit start/end times are supplied
+for a generated sprint.
 
 A node failure is routed to `fallback_error` after its transaction rolls back.
 The result retains completed state, includes a sanitized `errors` entry, and

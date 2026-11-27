@@ -352,8 +352,8 @@ async def create_action_drafts_node(
 ) -> dict[str, object]:
     """Persist replay-safe, approval-gated drafts in the caller's transaction.
 
-    Explicit aware start/end times are required for a calendar draft when a sprint
-    exists; scheduling is never invented. The caller commits before checkpointing.
+    A calendar draft is created only with explicit aware start/end times;
+    scheduling is never invented. The caller commits before checkpointing.
     A run row lock serializes concurrent replays. Existing draft status is retained;
     no tracker/calendar side effect or approval transition is performed.
     """
@@ -388,7 +388,7 @@ async def create_action_drafts_node(
         notes=tracker.notes if tracker else None,
     )
     payloads: list[TrackerUpsertPayload | CalendarBlockPayload] = [tracker_payload]
-    if sprint is not None:
+    if sprint is not None and (calendar_start is not None or calendar_end is not None):
         if calendar_start is None or calendar_end is None:
             raise ValueError("Explicit calendar start and end are required for a sprint draft")
         if calendar_start.utcoffset() is None or calendar_end.utcoffset() is None:
@@ -404,8 +404,6 @@ async def create_action_drafts_node(
                 ],
             )
         )
-    elif calendar_start is not None or calendar_end is not None:
-        raise ValueError("Calendar times supplied without a sprint")
     repo = DraftRepo(session)
     records: list[ActionDraftRecord] = []
     for payload in payloads:
