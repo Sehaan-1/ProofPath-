@@ -1,0 +1,8 @@
+Async Alembic database migrations for ProofPath (PostgreSQL 16 + pgvector).
+
+Run migrations locally with:
+    make migrate
+    # or: alembic upgrade head
+
+Generate offline SQL preview without a live database:
+    alembic upgrade head --sql
