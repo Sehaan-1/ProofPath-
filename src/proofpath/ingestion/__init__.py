@@ -1,5 +1,14 @@
 """Local and remote evidence ingestion pipelines."""
 
+from proofpath.ingestion.analyse_role import (
+    ANALYSE_ROLE_SYSTEM_PROMPT,
+    AnalyseRoleExtractor,
+    AnalyseRoleResult,
+    OpenAIRoleParser,
+    RoleParseError,
+    create_role_parser,
+    persist_parsed_role,
+)
 from proofpath.ingestion.chunking import ParsedChunk, chunk_document
 from proofpath.ingestion.github_ingester import (
     GitHubEvidenceClient,
@@ -43,9 +52,12 @@ from proofpath.ingestion.resume_parser import (
 )
 
 __all__ = [
+    "ANALYSE_ROLE_SYSTEM_PROMPT",
     "UNTRUSTED_INPUT_INSTRUCTION",
     "UNTRUSTED_JD_CLOSE",
     "UNTRUSTED_JD_OPEN",
+    "AnalyseRoleExtractor",
+    "AnalyseRoleResult",
     "EmptyDocumentError",
     "EmptyJobDescriptionError",
     "FolderIngestResult",
@@ -61,12 +73,15 @@ __all__ = [
     "JobPageFetchError",
     "JobPageFetcher",
     "LocalEvidenceIngester",
+    "OpenAIRoleParser",
     "ParsedChunk",
     "ParsedDocument",
+    "RoleParseError",
     "UnsupportedDocumentError",
     "build_parser_prompt",
     "canonical_github_uri",
     "chunk_document",
+    "create_role_parser",
     "extract_job_posting_text",
     "infer_source_type",
     "isolate_job_description",
@@ -75,6 +90,7 @@ __all__ = [
     "parse_resume_file",
     "parse_resume_text",
     "persist_parsed_document",
+    "persist_parsed_role",
     "snapshot_to_document",
     "wrap_untrusted_job_description",
 ]
