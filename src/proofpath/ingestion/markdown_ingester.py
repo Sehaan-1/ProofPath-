@@ -121,6 +121,8 @@ class LocalEvidenceIngester:
 async def persist_parsed_document(
     repo: EvidenceRepo,
     document: ParsedDocument,
+    *,
+    replace_existing: bool = True,
 ) -> IngestFileResult:
     """Insert or skip/re-index a parsed document using SHA-256 and canonical URI."""
     existing_sha = await repo.get_source_by_sha256(document.content_sha256)
@@ -139,6 +141,8 @@ async def persist_parsed_document(
     status = IngestStatus.CREATED
     existing_uri = await repo.get_source_by_uri(document.canonical_uri)
     if existing_uri is not None:
+        if not replace_existing:
+            raise ValueError("Evidence URI already exists with different content.")
         await repo.delete_source(existing_uri.id)
         status = IngestStatus.REINDEXED
 
