@@ -42,7 +42,7 @@ def test_migration_history_has_single_linear_head() -> None:
     cfg = _make_alembic_config()
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    assert heads == ["0002_add_vector_and_fts_indexes"]
+    assert heads == ["0003_requirement_entity"]
     revisions = {rev.revision for rev in script.walk_revisions()}
     assert {"0001_initial_schema", "0002_add_vector_and_fts_indexes"}.issubset(revisions)
 

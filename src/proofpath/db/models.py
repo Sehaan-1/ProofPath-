@@ -265,6 +265,7 @@ class RoleRequirement(Base):
         nullable=False,
     )
     requirement_text: Mapped[str] = mapped_column(Text, nullable=False)
+    entity: Mapped[str | None] = mapped_column(String(255), nullable=True)
     category: Mapped[RequirementCategory] = mapped_column(
         SAEnum(
             RequirementCategory,
