@@ -29,6 +29,8 @@ dependencies = [
     # LLM & embedding SDK (OpenAI; 2.x retains httpx compatibility with respx and guardrails-ai)
     "openai>=2.54.0,<3.0.0",
     "langchain-openai>=1.8.5,<2.0.0",
+    # Local document ingestion (resume/CV PDF + markdown/notes)
+    "pypdf>=7.2.0,<8.0.0",
 ]
 
 [project.optional-dependencies]
@@ -97,6 +99,7 @@ known-first-party = ["proofpath"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ARG001", "ARG002", "PT011"]
+"src/proofpath/ingestion/**" = ["ASYNC221", "ASYNC240"]
 "evals/**" = ["T201"]
 "migrations/**" = ["E501", "F401", "UP"]
 

@@ -61,6 +61,7 @@ def test_core_runtime_dependencies_are_pinned_and_bounded() -> None:
         "redis",
         "openai",
         "langchain-openai",
+        "pypdf",
     }
     assert expected_core.issubset(dep_names)
 
