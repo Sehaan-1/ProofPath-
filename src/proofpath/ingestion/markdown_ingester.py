@@ -96,7 +96,7 @@ class LocalEvidenceIngester:
     ) -> IngestFileResult:
         """Parse one local file and upsert it into the Evidence Ledger."""
         document = parse_resume_file(path, source_type=source_type)
-        return await self._persist(document)
+        return await persist_parsed_document(self._repo, document)
 
     async def ingest_folder(
         self,
@@ -117,52 +117,57 @@ class LocalEvidenceIngester:
             results.append(await self.ingest_file(file_path))
         return FolderIngestResult(root=resolved, files=tuple(results))
 
-    async def _persist(self, document: ParsedDocument) -> IngestFileResult:
-        existing_sha = await self._repo.get_source_by_sha256(document.content_sha256)
-        if existing_sha is not None:
-            chunk_count = len(await self._repo.list_chunks_for_source(existing_sha.id))
-            return IngestFileResult(
-                path=document.path or Path(document.canonical_uri),
-                canonical_uri=document.canonical_uri,
-                content_sha256=document.content_sha256,
-                status=IngestStatus.SKIPPED_UNCHANGED,
-                source_id=existing_sha.id,
-                chunk_count=chunk_count,
-                source_type=existing_sha.source_type,
-            )
 
-        status = IngestStatus.CREATED
-        existing_uri = await self._repo.get_source_by_uri(document.canonical_uri)
-        if existing_uri is not None:
-            await self._repo.delete_source(existing_uri.id)
-            status = IngestStatus.REINDEXED
-
-        source = await self._repo.create_source(
-            source_type=document.source_type,
-            title=document.title,
-            canonical_uri=document.canonical_uri,
-            content_sha256=document.content_sha256,
-            metadata_json=dict(document.metadata),
-        )
-        chunk_inputs = [
-            EvidenceChunkInput(
-                chunk_index=index,
-                content=chunk.content,
-                token_count=chunk.token_count,
-                section_label=chunk.section_label,
-            )
-            for index, chunk in enumerate(document.chunks)
-        ]
-        stored = await self._repo.add_chunks(source.id, chunk_inputs)
+async def persist_parsed_document(
+    repo: EvidenceRepo,
+    document: ParsedDocument,
+) -> IngestFileResult:
+    """Insert or skip/re-index a parsed document using SHA-256 and canonical URI."""
+    existing_sha = await repo.get_source_by_sha256(document.content_sha256)
+    if existing_sha is not None:
+        chunk_count = len(await repo.list_chunks_for_source(existing_sha.id))
         return IngestFileResult(
             path=document.path or Path(document.canonical_uri),
             canonical_uri=document.canonical_uri,
             content_sha256=document.content_sha256,
-            status=status,
-            source_id=source.id,
-            chunk_count=len(stored),
-            source_type=source.source_type,
+            status=IngestStatus.SKIPPED_UNCHANGED,
+            source_id=existing_sha.id,
+            chunk_count=chunk_count,
+            source_type=existing_sha.source_type,
         )
+
+    status = IngestStatus.CREATED
+    existing_uri = await repo.get_source_by_uri(document.canonical_uri)
+    if existing_uri is not None:
+        await repo.delete_source(existing_uri.id)
+        status = IngestStatus.REINDEXED
+
+    source = await repo.create_source(
+        source_type=document.source_type,
+        title=document.title,
+        canonical_uri=document.canonical_uri,
+        content_sha256=document.content_sha256,
+        metadata_json=dict(document.metadata),
+    )
+    chunk_inputs = [
+        EvidenceChunkInput(
+            chunk_index=index,
+            content=chunk.content,
+            token_count=chunk.token_count,
+            section_label=chunk.section_label,
+        )
+        for index, chunk in enumerate(document.chunks)
+    ]
+    stored = await repo.add_chunks(source.id, chunk_inputs)
+    return IngestFileResult(
+        path=document.path or Path(document.canonical_uri),
+        canonical_uri=document.canonical_uri,
+        content_sha256=document.content_sha256,
+        status=status,
+        source_id=source.id,
+        chunk_count=len(stored),
+        source_type=source.source_type,
+    )
 
 
 def iter_local_notes(
@@ -199,4 +204,5 @@ __all__ = [
     "LocalEvidenceIngester",
     "is_supported_local_file",
     "iter_local_notes",
+    "persist_parsed_document",
 ]
