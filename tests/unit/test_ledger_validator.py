@@ -1,10 +1,10 @@
-"""Unit tests for Sub-part 1.2.2a (citation existence check)."""
+"""Unit tests for Sub-parts 1.2.2a (citation existence) and 1.2.2b (downgrade)."""
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
-from dataclasses import FrozenInstanceError
+from collections.abc import Mapping, Sequence
+from dataclasses import FrozenInstanceError, dataclass
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -14,9 +14,13 @@ from proofpath.db.models import AuditActor, VerdictType
 from proofpath.db.repositories.audit import AuditRepo
 from proofpath.policy import (
     CITATION_MISSING_EVENT,
+    CLAIM_DOWNGRADED_EVENT,
     CitationCheckResult,
+    DowngradeReason,
     LedgerValidator,
+    apply_unsupported_downgrade,
     check_citation_existence,
+    chunk_supports_entity,
 )
 from proofpath.schemas import ClaimVerdictSchema
 
@@ -33,23 +37,46 @@ def _verdict(
     requirement_id: uuid.UUID = _REQ_1,
     cited: Sequence[uuid.UUID] = (),
     verdict: VerdictType = VerdictType.SUPPORTED,
+    gap_notes: str | None = None,
 ) -> ClaimVerdictSchema:
     return ClaimVerdictSchema(
         requirement_id=requirement_id,
         verdict=verdict,
         claim_summary="LLM claim under citation review.",
         cited_chunk_ids=list(cited),
+        gap_notes=gap_notes,
     )
 
 
+@dataclass
+class _FakeChunk:
+    id: uuid.UUID
+    content: str
+    section_label: str | None = None
+
+
 class _FakeChunkLookup:
-    def __init__(self, existing: set[uuid.UUID]) -> None:
-        self.existing = existing
+    def __init__(
+        self,
+        existing: set[uuid.UUID] | None = None,
+        contents: Mapping[uuid.UUID, str] | None = None,
+    ) -> None:
+        self.contents = dict(contents or {})
+        self.existing = set(existing) if existing is not None else set(self.contents)
         self.calls: list[list[uuid.UUID]] = []
+        self.content_calls: list[list[uuid.UUID]] = []
 
     async def get_existing_chunk_ids(self, chunk_ids: Sequence[uuid.UUID]) -> set[uuid.UUID]:
         self.calls.append(list(chunk_ids))
         return {chunk_id for chunk_id in chunk_ids if chunk_id in self.existing}
+
+    async def get_chunks_by_ids(self, chunk_ids: Sequence[uuid.UUID]) -> list[_FakeChunk]:
+        self.content_calls.append(list(chunk_ids))
+        return [
+            _FakeChunk(id=chunk_id, content=self.contents[chunk_id])
+            for chunk_id in chunk_ids
+            if chunk_id in self.contents
+        ]
 
 
 @pytest.mark.unit
@@ -246,3 +273,198 @@ def test_citation_check_result_is_exported_as_frozen_dataclass() -> None:
     assert isinstance(result, CitationCheckResult)
     with pytest.raises(FrozenInstanceError):
         result.valid_chunk_ids = frozenset()  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Sub-part 1.2.2b — Unsupported-claim downgrade
+# ---------------------------------------------------------------------------
+
+_FASTAPI_TEXT = "Shipped a FastAPI + pgvector evidence ledger with MCP tools."
+_K8S_TEXT = "Deployed Kubernetes clusters with Helm charts."
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("text", "entity", "expected"),
+    [
+        (_FASTAPI_TEXT, "FastAPI", True),
+        (_FASTAPI_TEXT, "fastapi", True),
+        (_FASTAPI_TEXT, "pgvector", True),
+        (_FASTAPI_TEXT, "MCP", True),
+        (_FASTAPI_TEXT, "SAP S/4HANA", False),
+        (_FASTAPI_TEXT, "Salesforce Apex", False),
+        ("Configured SAP S/4HANA finance modules.", "SAP S/4HANA", True),
+        ("Worked on SAPS4HANA migrations.", "SAP S/4HANA", True),
+        ("used C++ and Python", "C++", True),
+        ("going to the office", "Go", False),
+        ("used go for the CLI", "Go", True),
+        ("email automation scripts", "AI", False),
+        ("Built AI agents with LangGraph.", "AI", True),
+        ("", "FastAPI", False),
+        (_FASTAPI_TEXT, "  ", False),
+    ],
+)
+def test_chunk_supports_entity_is_deterministic(text: str, entity: str, expected: bool) -> None:
+    assert chunk_supports_entity(text, entity) is expected
+
+
+@pytest.mark.unit
+def test_empty_citations_downgrade_supported_and_partial_claims() -> None:
+    supported = _verdict(cited=[], verdict=VerdictType.SUPPORTED)
+    partial = _verdict(
+        requirement_id=_REQ_2,
+        cited=[],
+        verdict=VerdictType.PARTIAL,
+        gap_notes="Need a production MCP server.",
+    )
+    already_unsupported = _verdict(
+        requirement_id=uuid.uuid4(),
+        cited=[],
+        verdict=VerdictType.UNSUPPORTED,
+    )
+
+    result = apply_unsupported_downgrade(
+        [supported, partial, already_unsupported],
+        chunk_texts={},
+    )
+
+    assert result.ok is False
+    assert len(result.downgrades) == 2
+    assert result.verdicts[0].verdict is VerdictType.UNSUPPORTED
+    assert result.verdicts[0].policy_downgraded is True
+    assert result.verdicts[0].gap_notes is not None
+    assert "zero valid evidence citations" in result.verdicts[0].gap_notes
+    assert result.verdicts[1].verdict is VerdictType.UNSUPPORTED
+    assert result.verdicts[1].policy_downgraded is True
+    assert result.verdicts[1].gap_notes is not None
+    assert "Need a production MCP server." in result.verdicts[1].gap_notes
+    assert result.verdicts[2].verdict is VerdictType.UNSUPPORTED
+    assert result.verdicts[2].policy_downgraded is False
+    assert {event.reason for event in result.downgrades} == {DowngradeReason.EMPTY_CITATIONS}
+
+
+@pytest.mark.unit
+def test_entity_absent_from_cited_text_downgrades_and_keeps_chunk_ids() -> None:
+    result = apply_unsupported_downgrade(
+        [_verdict(cited=[_LEDGER_A], verdict=VerdictType.SUPPORTED)],
+        chunk_texts={_LEDGER_A: _FASTAPI_TEXT},
+        entities_by_requirement={_REQ_1: "SAP S/4HANA"},
+    )
+
+    assert result.ok is False
+    assert result.downgrades[0].reason is DowngradeReason.ENTITY_NOT_IN_EVIDENCE
+    assert result.downgrades[0].entity == "SAP S/4HANA"
+    assert result.downgrades[0].original_verdict is VerdictType.SUPPORTED
+    assert result.verdicts[0].verdict is VerdictType.UNSUPPORTED
+    assert result.verdicts[0].policy_downgraded is True
+    assert result.verdicts[0].cited_chunk_ids == [_LEDGER_A]
+    assert result.verdicts[0].gap_notes is not None
+    assert "SAP S/4HANA" in result.verdicts[0].gap_notes
+
+
+@pytest.mark.unit
+def test_entity_present_in_any_cited_chunk_preserves_verdict() -> None:
+    result = apply_unsupported_downgrade(
+        [_verdict(cited=[_LEDGER_A, _LEDGER_B], verdict=VerdictType.PARTIAL)],
+        chunk_texts={_LEDGER_A: _K8S_TEXT, _LEDGER_B: _FASTAPI_TEXT},
+        entities_by_requirement={_REQ_1: "FastAPI"},
+    )
+    assert result.ok is True
+    assert result.verdicts[0].verdict is VerdictType.PARTIAL
+    assert result.verdicts[0].policy_downgraded is False
+
+
+@pytest.mark.unit
+def test_entity_check_is_skipped_when_no_entity_mapping_is_supplied() -> None:
+    result = apply_unsupported_downgrade(
+        [_verdict(cited=[_LEDGER_A])],
+        chunk_texts={_LEDGER_A: _FASTAPI_TEXT},
+    )
+    assert result.ok is True
+    assert result.verdicts[0].verdict is VerdictType.SUPPORTED
+
+
+@pytest.mark.unit
+def test_missing_chunk_text_is_treated_as_not_supporting_entity() -> None:
+    result = apply_unsupported_downgrade(
+        [_verdict(cited=[_LEDGER_A])],
+        chunk_texts={},
+        entities_by_requirement={_REQ_1: "FastAPI"},
+    )
+    assert result.downgrades[0].reason is DowngradeReason.ENTITY_NOT_IN_EVIDENCE
+
+
+@pytest.mark.unit
+async def test_enforce_strips_unknown_ids_then_downgrades_empty_supported_claim() -> None:
+    lookup = _FakeChunkLookup(existing={_LEDGER_A}, contents={_LEDGER_A: _FASTAPI_TEXT})
+    audit = AsyncMock(spec=AuditRepo)
+    validator = LedgerValidator(lookup, audit_repo=audit)
+
+    result = await validator.enforce(
+        [_verdict(cited=[_HALLUCINATED], verdict=VerdictType.SUPPORTED)],
+        entities_by_requirement={_REQ_1: "FastAPI"},
+        analysis_run_id=_RUN_ID,
+    )
+
+    assert result.ok is False
+    assert result.citation_check.unknown_chunk_ids == frozenset({_HALLUCINATED})
+    assert result.verdicts[0].cited_chunk_ids == []
+    assert result.verdicts[0].verdict is VerdictType.UNSUPPORTED
+    assert result.verdicts[0].policy_downgraded is True
+    assert result.policy_downgraded_count == 1
+    assert result.downgrades[0].reason is DowngradeReason.EMPTY_CITATIONS
+
+    event_types = [call.kwargs["event_type"] for call in audit.record.await_args_list]
+    assert event_types == [CITATION_MISSING_EVENT, CLAIM_DOWNGRADED_EVENT]
+
+
+@pytest.mark.unit
+async def test_enforce_downgrades_when_cited_chunk_does_not_mention_entity() -> None:
+    lookup = _FakeChunkLookup(contents={_LEDGER_A: _FASTAPI_TEXT})
+    audit = AsyncMock(spec=AuditRepo)
+    validator = LedgerValidator(lookup, audit_repo=audit)
+
+    result = await validator.enforce(
+        [_verdict(cited=[_LEDGER_A])],
+        entities_by_requirement={_REQ_1: "SAP S/4HANA"},
+        analysis_run_id=_RUN_ID,
+    )
+
+    assert result.citation_check.ok is True
+    assert result.verdicts[0].verdict is VerdictType.UNSUPPORTED
+    assert result.verdicts[0].policy_downgraded is True
+    assert result.verdicts[0].cited_chunk_ids == [_LEDGER_A]
+    audit.record.assert_awaited_once()
+    kwargs: dict[str, Any] = audit.record.await_args.kwargs
+    assert kwargs["event_type"] == CLAIM_DOWNGRADED_EVENT
+    assert kwargs["details_json"]["reason"] == DowngradeReason.ENTITY_NOT_IN_EVIDENCE.value
+    assert kwargs["details_json"]["entity"] == "SAP S/4HANA"
+    assert kwargs["details_json"]["analysis_run_id"] == str(_RUN_ID)
+
+
+@pytest.mark.unit
+async def test_enforce_keeps_supported_claim_when_entity_is_in_ledger_text() -> None:
+    lookup = _FakeChunkLookup(contents={_LEDGER_A: _FASTAPI_TEXT})
+    audit = AsyncMock(spec=AuditRepo)
+    validator = LedgerValidator(lookup, audit_repo=audit)
+
+    result = await validator.enforce(
+        [_verdict(cited=[_LEDGER_A])],
+        entities_by_requirement={_REQ_1: "FastAPI"},
+    )
+
+    assert result.ok is True
+    assert result.verdicts[0].verdict is VerdictType.SUPPORTED
+    assert result.verdicts[0].policy_downgraded is False
+    audit.record.assert_not_awaited()
+
+
+@pytest.mark.unit
+async def test_apply_unsupported_downgrade_requires_chunk_loader() -> None:
+    class _IdsOnly:
+        async def get_existing_chunk_ids(self, chunk_ids: Sequence[uuid.UUID]) -> set[uuid.UUID]:
+            return set(chunk_ids)
+
+    validator = LedgerValidator(_IdsOnly())
+    with pytest.raises(TypeError, match="get_chunks_by_ids"):
+        await validator.apply_unsupported_downgrade([_verdict(cited=[_LEDGER_A])])
