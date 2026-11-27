@@ -26,6 +26,7 @@ class RoleRequirementInput:
     category: RequirementCategory
     priority: RequirementPriority
     requirement_id: uuid.UUID | None = None
+    entity: str | None = None
 
 
 class OpportunityRepo:
@@ -103,6 +104,7 @@ class OpportunityRepo:
                 id=item.requirement_id or uuid.uuid4(),
                 opportunity_id=opportunity_id,
                 requirement_text=item.requirement_text,
+                entity=item.entity,
                 category=item.category,
                 priority=item.priority,
             )

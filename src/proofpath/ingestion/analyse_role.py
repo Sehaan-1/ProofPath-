@@ -187,6 +187,7 @@ async def persist_parsed_role(
         [
             RoleRequirementInput(
                 requirement_text=item.requirement_text,
+                entity=item.entity,
                 category=item.category,
                 priority=item.priority,
             )

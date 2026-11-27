@@ -162,6 +162,7 @@ def test_opportunity_and_role_requirement_schema_and_constraints() -> None:
         "id",
         "opportunity_id",
         "requirement_text",
+        "entity",
         "category",
         "priority",
     }
