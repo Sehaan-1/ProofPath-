@@ -62,6 +62,7 @@ def test_core_runtime_dependencies_are_pinned_and_bounded() -> None:
         "openai",
         "langchain-openai",
         "pypdf",
+        "beautifulsoup4",
     }
     assert expected_core.issubset(dep_names)
 
