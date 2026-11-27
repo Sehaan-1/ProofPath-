@@ -13,6 +13,7 @@ dependencies = [
     "uvicorn[standard]>=0.54.0,<0.55.0",
     "pydantic>=2.14.4,<3.0.0",
     "pydantic-settings>=2.16.3,<3.0.0",
+    "python-multipart>=0.0.34,<0.1.0",
     # Database, migrations & vector search
     "sqlalchemy[asyncio]>=2.1.9,<3.0.0",
     "asyncpg>=0.32.0,<0.33.0",
