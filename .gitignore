@@ -1,0 +1,87 @@
+# =============================================================================
+# Secrets & Environment Files
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+token.json
+
+# =============================================================================
+# Local Personal Evidence, Resumes & PDFs
+# =============================================================================
+*.pdf
+*.docx
+resumes/
+data/resumes/
+local_evidence/
+*resume*.md
+*resume*.txt
+*cv*.md
+*cv*.txt
+
+# =============================================================================
+# SQLite Databases, Trace Dumps & Ephemeral Exports
+# =============================================================================
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+traces/
+trace_dumps/
+*.trace.json
+*.trace.jsonl
+*.har
+*.ics
+evals/reports/*.html
+evals/reports/*.json
+
+# =============================================================================
+# Python Bytecode, Packaging & Virtual Environments
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# =============================================================================
+# Testing, Linting, Type Checking & E2E Artifacts
+# =============================================================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+playwright-report/
+test-results/
+
+# =============================================================================
+# Frontend (Phase 3 Optional)
+# =============================================================================
+frontend/node_modules/
+frontend/dist/
+
+# =============================================================================
+# IDE & OS Files
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
