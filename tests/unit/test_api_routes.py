@@ -182,13 +182,27 @@ def test_opportunity_and_tracker_reads(client, monkeypatch):
     tracker.list_entries.assert_awaited_once_with(limit=5, offset=1)
 
 
-def test_opportunity_url_only_is_not_fetched(client):
+def test_opportunity_url_uses_safe_fetcher(client, monkeypatch):
+    from proofpath.schemas.opportunity import OpportunityResponse
+
     test_client, _ = client
+    output = OpportunityResponse(
+        id=uuid4(),
+        company="Example",
+        role_title="Engineer",
+        source_url=None,
+        created_at=datetime.now(UTC),
+        requirements=[],
+    )
+    extractor = MagicMock()
+    extractor.analyse = AsyncMock(return_value=SimpleNamespace(to_response=lambda: output))
+    monkeypatch.setattr(routes, "create_role_parser", lambda _settings: object())
+    monkeypatch.setattr(routes, "AnalyseRoleExtractor", lambda _repo, _parser: extractor)
     response = test_client.post(
         "/api/v1/opportunities", json={"source_url": "https://example.com/job"}
     )
-    assert response.status_code == 422
-    assert "URL-only" in response.json()["detail"]
+    assert response.status_code == 201
+    assert isinstance(extractor.analyse.await_args.kwargs["fetcher"], routes.SecureJobPageFetcher)
 
 
 async def test_request_session_rolls_back_on_failure():

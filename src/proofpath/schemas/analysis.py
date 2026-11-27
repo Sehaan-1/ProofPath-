@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from typing import Self
 
-from pydantic import Field, field_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from proofpath.db.models import AnalysisRunStatus, VerdictType
 from proofpath.schemas.actions import ActionDraftRecord, ContributionSprintPlan
@@ -83,6 +84,30 @@ class AnalysisRunCreateRequest(StrictModel):
         description="When true, enqueue the run and return 202 Accepted (Slice 2.2).",
     )
 
+    calendar_start: AwareDatetime | None = None
+    calendar_end: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _validate_calendar(self) -> Self:
+        if (self.calendar_start is None) != (self.calendar_end is None):
+            raise ValueError("Provide both calendar_start and calendar_end.")
+        if (
+            self.calendar_start is not None
+            and self.calendar_end is not None
+            and self.calendar_end <= self.calendar_start
+        ):
+            raise ValueError("calendar_end must be after calendar_start.")
+        return self
+
+
+class AnalysisError(StrictModel):
+    """Sanitized failure reported by a graph node."""
+
+    node: str
+    code: str
+    message: str
+    retryable: bool
+
 
 class AnalysisReport(StrictModel):
     """End-to-end analysis report returned by `GET /api/v1/analyses/{run_id}`."""
@@ -95,7 +120,7 @@ class AnalysisReport(StrictModel):
         description="LangGraph checkpoint thread id for resume/approval.",
     )
     status: AnalysisRunStatus
-    role: ParsedRole
+    role: ParsedRole | None = None
     requirements: list[RequirementRecord] = Field(default_factory=list)
     verdicts: list[ClaimVerdictSchema] = Field(default_factory=list)
     contribution_sprint: ContributionSprintPlan | None = None
@@ -104,6 +129,7 @@ class AnalysisReport(StrictModel):
     estimated_cost_usd: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=6)
     latency_ms: int = Field(default=0, ge=0)
     trace_id: str | None = Field(default=None, max_length=128)
+    errors: list[AnalysisError] = Field(default_factory=list)
 
     @field_validator("trace_id", mode="before")
     @classmethod

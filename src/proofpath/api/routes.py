@@ -26,9 +26,10 @@ from proofpath.ingestion.github_ingester import (
     GitHubRepoRef,
     snapshot_to_document,
 )
-from proofpath.ingestion.job_fetcher import EmptyJobDescriptionError
+from proofpath.ingestion.job_fetcher import EmptyJobDescriptionError, JobPageFetchError
 from proofpath.ingestion.markdown_ingester import IngestStatus, persist_parsed_document
 from proofpath.ingestion.resume_parser import ParsedDocument, hash_bytes, parse_resume_text
+from proofpath.ingestion.secure_job_fetcher import SecureJobPageFetcher
 from proofpath.retrieval.embeddings import create_embedding_client
 from proofpath.retrieval.hybrid_search import HybridSearcher
 from proofpath.schemas.actions import TrackerRecord
@@ -260,19 +261,15 @@ async def list_tracker(
 async def create_opportunity(
     payload: OpportunityCreateRequest, request: Request, session: Session
 ) -> OpportunityResponse:
-    """Extract requirements from pasted text and persist the opportunity atomically.
-
-    URL-only fetching is not exposed here until redirect and DNS SSRF protections
-    are implemented for the job fetcher.
-    """
-    if payload.raw_text is None:
-        raise HTTPException(422, "Paste job description text; URL-only fetching is not enabled.")
+    """Extract and persist requirements from pasted text or a public posting."""
     settings = request.app.state.settings
     if settings.llm_provider is not LLMProvider.OPENAI:
         raise HTTPException(501, "Role parsing is supported only with OpenAI.")
     extractor = AnalyseRoleExtractor(OpportunityRepo(session), create_role_parser(settings))
     try:
-        result = await extractor.analyse(payload)
+        result = await extractor.analyse(payload, fetcher=SecureJobPageFetcher())
     except EmptyJobDescriptionError as exc:
         raise HTTPException(422, "Job description is empty.") from exc
+    except JobPageFetchError as exc:
+        raise HTTPException(422, "Job posting could not be fetched safely.") from exc
     return result.to_response()
