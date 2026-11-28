@@ -19,7 +19,11 @@ from proofpath.db.models import EvidenceSourceType
 from proofpath.db.repositories.evidence import EvidenceRepo
 from proofpath.db.repositories.opportunity import OpportunityRepo
 from proofpath.db.repositories.tracker import TrackerRepo
-from proofpath.ingestion.analyse_role import AnalyseRoleExtractor, create_role_parser
+from proofpath.ingestion.analyse_role import (
+    AnalyseRoleExtractor,
+    RoleParseError,
+    create_role_parser,
+)
 from proofpath.ingestion.github_ingester import (
     GitHubEvidenceClient,
     GitHubIngestError,
@@ -265,11 +269,17 @@ async def create_opportunity(
     settings = request.app.state.settings
     if settings.llm_provider is not LLMProvider.OPENAI:
         raise HTTPException(501, "Role parsing is supported only with OpenAI.")
-    extractor = AnalyseRoleExtractor(OpportunityRepo(session), create_role_parser(settings))
+    try:
+        parser = create_role_parser(settings)
+    except ValueError as exc:
+        raise HTTPException(503, "Role parser model is not configured.") from exc
+    extractor = AnalyseRoleExtractor(OpportunityRepo(session), parser)
     try:
         result = await extractor.analyse(payload, fetcher=SecureJobPageFetcher())
     except EmptyJobDescriptionError as exc:
         raise HTTPException(422, "Job description is empty.") from exc
     except JobPageFetchError as exc:
         raise HTTPException(422, "Job posting could not be fetched safely.") from exc
+    except RoleParseError as exc:
+        raise HTTPException(502, "Job description could not be parsed.") from exc
     return result.to_response()

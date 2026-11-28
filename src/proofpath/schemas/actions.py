@@ -164,3 +164,32 @@ class TrackerRecord(StrictModel):
     stage: ApplicationStage
     notes: str | None = None
     updated_at: datetime
+
+
+class ApplicationStatusResponse(StrictModel):
+    """API/MCP response for the personal application-tracker status of an opportunity."""
+
+    opportunity_id: uuid.UUID
+    tracked: bool = Field(
+        description="True when an `application_tracker` entry exists for this opportunity.",
+    )
+    tracker_id: uuid.UUID | None = None
+    stage: ApplicationStage | None = None
+    notes: str | None = None
+    updated_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _validate_tracked_fields(self) -> Self:
+        if self.tracked:
+            if self.tracker_id is None or self.stage is None or self.updated_at is None:
+                raise ValueError(
+                    "tracked=True requires tracker_id, stage, and updated_at to be set."
+                )
+        elif any(
+            value is not None
+            for value in (self.tracker_id, self.stage, self.notes, self.updated_at)
+        ):
+            raise ValueError(
+                "tracked=False requires tracker_id, stage, notes, and updated_at to be None."
+            )
+        return self
