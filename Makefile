@@ -5,7 +5,7 @@ SHELL := /usr/bin/env bash
 PYTHON ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV)/bin/python,$(if $(wildcard .venv/bin/python),.venv/bin/python,python3))
 COMPOSE ?= docker compose
 
-.PHONY: help up down ps psql check-pgvector migrate lint format typecheck test-unit test-int mcp-dev eval
+.PHONY: help up down ps psql check-pgvector migrate lint format typecheck test-unit test-int mcp-dev eval worker
 
 help: ## Show available ProofPath targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -52,3 +52,6 @@ mcp-dev: ## Start the local ProofPath MCP server
 
 eval: ## Run the ProofPath golden evaluation suite
 	$(PYTHON) evals/run_evals.py
+
+worker: ## Start the local ProofPath background worker (drains the Redis job queue)
+	$(PYTHON) -m proofpath.workers

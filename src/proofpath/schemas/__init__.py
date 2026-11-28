@@ -32,6 +32,7 @@ from proofpath.schemas.evidence import (
     IngestResponse,
     IngestTextRequest,
 )
+from proofpath.schemas.jobs import BackgroundJobRecord, JobAcceptedResponse, JobStatusResponse
 from proofpath.schemas.opportunity import (
     OpportunityCreateRequest,
     OpportunityResponse,
@@ -59,6 +60,7 @@ __all__ = [
     "AnalysisRunCreateRequest",
     "ApplicationStatusResponse",
     "ApproveActionInput",
+    "BackgroundJobRecord",
     "CalendarBlockPayload",
     "CalendarTaskRecord",
     "ClaimVerdictSchema",
@@ -78,6 +80,8 @@ __all__ = [
     "IngestGitHubRequest",
     "IngestResponse",
     "IngestTextRequest",
+    "JobAcceptedResponse",
+    "JobStatusResponse",
     "OpportunityCreateRequest",
     "OpportunityResponse",
     "ParsedRole",

@@ -2,6 +2,7 @@
 
 from proofpath.db.models import (
     EMBEDDING_DIM,
+    JOB_TERMINAL_STATUSES,
     ActionDraft,
     ActionDraftStatus,
     ActionType,
@@ -11,12 +12,14 @@ from proofpath.db.models import (
     ApplicationTracker,
     AuditActor,
     AuditLog,
+    BackgroundJob,
     Base,
     CalendarTask,
     ClaimVerdict,
     EvidenceChunk,
     EvidenceSource,
     EvidenceSourceType,
+    JobStatus,
     Opportunity,
     RequirementCategory,
     RequirementPriority,
@@ -26,6 +29,7 @@ from proofpath.db.models import (
 from proofpath.db.repositories import (
     AnalysisRepo,
     AuditRepo,
+    BackgroundJobRepo,
     CalendarTaskRepo,
     ClaimVerdictInput,
     DraftRepo,
@@ -34,6 +38,7 @@ from proofpath.db.repositories import (
     OpportunityRepo,
     RoleRequirementInput,
     TrackerRepo,
+    background_job_record,
 )
 from proofpath.db.session import (
     DatabaseSessionManager,
@@ -44,6 +49,7 @@ from proofpath.db.session import (
 
 __all__ = [
     "EMBEDDING_DIM",
+    "JOB_TERMINAL_STATUSES",
     "ActionDraft",
     "ActionDraftStatus",
     "ActionType",
@@ -55,6 +61,8 @@ __all__ = [
     "AuditActor",
     "AuditLog",
     "AuditRepo",
+    "BackgroundJob",
+    "BackgroundJobRepo",
     "Base",
     "CalendarTask",
     "CalendarTaskRepo",
@@ -67,6 +75,7 @@ __all__ = [
     "EvidenceRepo",
     "EvidenceSource",
     "EvidenceSourceType",
+    "JobStatus",
     "Opportunity",
     "OpportunityRepo",
     "RequirementCategory",
@@ -75,6 +84,7 @@ __all__ = [
     "RoleRequirementInput",
     "TrackerRepo",
     "VerdictType",
+    "background_job_record",
     "create_db_engine",
     "create_session_factory",
     "verify_pgvector_extension",

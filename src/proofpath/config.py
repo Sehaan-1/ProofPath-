@@ -136,6 +136,25 @@ class Settings(BaseSettings):
         description="Mask personal phone numbers/addresses before external LLM calls.",
     )
 
+    # Background worker retry & dead-letter policy (Sub-slice 2.2.3)
+    job_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "Maximum processing attempts for a transiently-failing background job "
+            "before it is moved to the dead-letter state."
+        ),
+    )
+    job_retry_backoff_seconds: list[int] = Field(
+        default=[2, 8, 30],
+        description=(
+            "Exponential backoff delays (seconds) applied before re-enqueuing a "
+            "transiently-failed job, indexed by the failed attempt number. "
+            "Parsed from the environment as a JSON array, e.g. [2, 8, 30]."
+        ),
+    )
+
     @field_validator(
         "llm_api_key",
         "github_token",

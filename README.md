@@ -83,6 +83,96 @@ Calendar API (`events.import`); the local task and `.ics` file are always writte
 first and remain the source of truth. With the flag off, ProofPath makes no network
 call at all.
 
+## Background Worker & Redis Job Queue (Slice 2.2.1)
+
+A dedicated `worker` service in `docker-compose.yml` builds the shared proofpath
+image (`Dockerfile`, also reused by the future API service), waits for PostgreSQL
+and Redis to be healthy, and runs `python -m proofpath.workers`. Start everything
+with `make up`, or run the worker against the local containers with `make worker`.
+
+The queue is **Redis Streams** with a consumer group (`proofpath:jobs` /
+`proofpath-workers`), giving at-least-once delivery with a Pending Entries List
+(PEL) that tracks unacked messages. The authoritative, queryable job state lives
+in the `background_jobs` PostgreSQL table — Redis is the transport, Postgres is
+the ledger — correlated by job `id`:
+
+| `status` | meaning |
+|---|---|
+| `queued` | row persisted and a stream message enqueued |
+| `running` | a worker claimed it (`attempt` bumped, `SELECT … FOR UPDATE`) |
+| `succeeded` | terminal success; `result_json` carries the handler result |
+| `failed` | transient failure recorded; the message was re-enqueued for retry |
+| `dead_letter` | retries exhausted (or a permanent error); terminal, kept for replay |
+
+`proofpath.workers.JobQueue` provides the primitives (`enqueue`, `dequeue`,
+`ack`, `reclaim` via `XAUTOCLAIM` for crashed-consumer recovery). The
+`Worker` dequeues a message, loads the row, atomically moves it
+`queued/failed → running` under a row lock (so a duplicate delivery can never
+re-run a finished job), dispatches a registered `TaskHandler` **outside** the DB
+transaction, then finalizes the row and acks the Redis message. A transient
+failure re-enqueues and caps at `max_attempts` before moving to `dead_letter`; a
+permanent error (`transient=False`) or an unknown task type fails straight to
+`dead_letter`. The DB layer is hidden behind a `JobStore` protocol
+(`SqlAlchemyJobStore` is the production implementation) so the orchestration is
+fully unit-tested without a database.
+
+The registry ships two built-in smoke-test tasks — `noop` (succeeds immediately)
+and `echo` (returns its payload) — plus the real offloaded-work handlers below.
+
+### Retry & Dead-Letter Policy (Slice 2.2.3)
+
+**Exponential backoff.** A transiently-failed job is not re-enqueued immediately.
+It is placed in a Redis sorted set keyed by its "ready-at" timestamp
+(`now + backoff_delay`), and the worker's idle loop drains ready items back onto
+the stream via `drain_ready_retries`. This keeps the worker productive during the
+backoff window (no blocking sleep) and survives a worker restart. The default
+schedule is `JOB_RETRY_BACKOFF_SECONDS=[2, 8, 30]` seconds, indexed by the failed
+attempt number; `JOB_MAX_ATTEMPTS=3` caps the total attempts. Both are
+configurable via `.env`. A handler returning `transient=False` (validation errors,
+unknown task types, bad inputs, permanent HTTP 4xx) goes **straight to
+`dead_letter`** with no delay or retry — only transient HTTP/LLM errors
+(429/5xx/network/timeout) are retried.
+
+**Dead-letter audit trail.** When a job is pushed to `dead_letter` (retries
+exhausted or a permanent error), an immutable `audit_logs` entry
+(`event_type="background_job.dead_lettered"`, `actor="agent"`) is appended in the
+*same PostgreSQL transaction* as the status transition, capturing the error
+message, job type, attempt budget, and a bounded traceback (≤ 8 KiB, tail kept).
+This makes every terminal failure queryable via the audit log independently of
+the `background_jobs` row.
+
+### Async Workflows & Job Status (Slice 2.2.2)
+
+Long-running ingestion and full analyses are offloaded to the worker so the API
+responds immediately with `202 Accepted` + a `job_id`. The client then polls
+`GET /api/v1/jobs/{job_id}` until the job reaches a terminal state
+(`succeeded` / `dead_letter`).
+
+- **Async GitHub ingestion & batch embedding** —
+  `POST /api/v1/evidence/ingest/github?async=true` validates the repo reference,
+  enqueues a `github_ingest` job (ledger row + Redis message), and returns
+  `202` + `job_id`. The worker fetches the snapshot, persists the evidence
+  source, embeds the chunks, and records `{source_id, chunk_count, ...}` in the
+  job `result`. A GitHub 404/422 fails fast to `dead_letter`; a 429/5xx/network
+  error is retried up to `max_attempts`.
+- **Async full opportunity analysis** —
+  `POST /api/v1/analyses/run?async=true` (or body `{"async_run": true}`) validates
+  the opportunity and model wiring, enqueues an `analysis_run` job, and returns
+  `202` + `job_id`. The worker creates the `analysis_runs` row + checkpoint
+  thread, runs the same `execute_analysis_graph` routine as the synchronous path,
+  and records `{analysis_run_id, thread_id, status}` in the job `result` — so the
+  client can then `GET /api/v1/analyses/{analysis_run_id}` for the full report. A
+  graph that reaches a terminal `failed` state is treated as job success (the
+  outcome is recorded), avoiding duplicate runs on retry; only a missing
+  opportunity or unconfigured model fails fast to `dead_letter`.
+- **`GET /api/v1/jobs/{job_id}`** — trimmed, public status view of one
+  `background_jobs` row (`status`, `attempt`/`max_attempts`, `last_error`,
+  `result`, lifecycle timestamps). Omits the raw payload and Python traceback.
+
+The producer (`enqueue_job`) commits the ledger row *before* the Redis `XADD`, so
+a worker can never receive a message whose status row is uncommitted; if the
+append itself fails the row is moved to `dead_letter` and the API returns `503`.
+
 ## Local ProofPath MCP Server (Read-Only & Approval-Gated Tools)
 
 Start the local MCP server over `stdio` (default for IDE / agent clients):

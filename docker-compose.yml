@@ -39,6 +39,36 @@ services:
       retries: 10
       start_period: 5s
 
+  worker:
+    # Sub-part 2.2.1a: dedicated background worker sharing the proofpath codebase
+    # (built from the shared Dockerfile) and connecting to Redis and PostgreSQL.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Inside the compose network the services resolve by hostname.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-proofpath}:${POSTGRES_PASSWORD:-proofpath}@postgres:5432/${POSTGRES_DB:-proofpath}
+      REDIS_URL: redis://redis:6379/0
+      MAX_AGENT_RETRIES: ${MAX_AGENT_RETRIES:-2}
+      # Task-provider wiring used by Sub-slice 2.2.2 handlers; harmless defaults now.
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      OBSERVABILITY_BACKEND: ${OBSERVABILITY_BACKEND:-none}
+      REDACT_PII: ${REDACT_PII:-false}
+    command: ["python", "-m", "proofpath.workers"]
+
 volumes:
   postgres_data:
   redis_data:

@@ -38,6 +38,8 @@ _MANAGED_ENV_VARS = (
     "OBSERVABILITY_BACKEND",
     "MAX_AGENT_RETRIES",
     "REDACT_PII",
+    "JOB_MAX_ATTEMPTS",
+    "JOB_RETRY_BACKOFF_SECONDS",
 )
 
 
@@ -63,6 +65,8 @@ def test_settings_defaults() -> None:
     assert settings.observability_backend is ObservabilityBackend.NONE
     assert settings.max_agent_retries == 2
     assert settings.redact_pii is False
+    assert settings.job_max_attempts == 3
+    assert settings.job_retry_backoff_seconds == [2, 8, 30]
     # Live Google Calendar writes are opt-in only, never on by default.
     assert settings.enable_google_calendar is False
     assert settings.google_calendar_id is None

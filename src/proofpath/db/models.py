@@ -707,3 +707,111 @@ class AuditLog(Base):
         server_default=func.now(),
         index=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sub-part 2.2.1b — Background job status ledger
+# ---------------------------------------------------------------------------
+
+
+class JobStatus(StrEnum):
+    """Lifecycle state of a Redis-queued background job.
+
+    Redis Streams are the *transport*; the `background_jobs` table is the
+    authoritative, queryable status ledger. A job flows ``queued -> running ->
+    (succeeded | failed)``. A transient ``failed`` attempt is re-enqueued for
+    retry; once ``attempt`` reaches ``max_attempts`` (or a handler reports a
+    permanent error) the row moves to the terminal ``dead_letter`` state.
+    Exponential backoff timing and a dead-letter replay CLI arrive in
+    Sub-slice 2.2.3.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
+
+
+#: Terminal states — a worker skips (and acks) any message whose job is already
+#: in one of these, so a duplicate delivery can never re-run a finished job.
+JOB_TERMINAL_STATUSES: frozenset[JobStatus] = frozenset(
+    {JobStatus.SUCCEEDED, JobStatus.DEAD_LETTER}
+)
+
+
+class BackgroundJob(Base):
+    """Durable status ledger row for a Redis-queued background job.
+
+    The job ``id`` is the correlation key carried in every Redis stream message,
+    so the queue (Redis) and the status ledger (PostgreSQL) stay decoupled: the
+    worker dequeues a message, loads this row by id, and drives its state machine
+    here while acking/re-enqueueing purely against Redis.
+    """
+
+    __tablename__ = "background_jobs"
+    __table_args__ = (
+        CheckConstraint("attempt >= 0", name="attempt_non_negative"),
+        CheckConstraint("max_attempts >= 1", name="max_attempts_at_least_one"),
+        Index("ix_background_jobs_status", "status"),
+        Index("ix_background_jobs_job_type", "job_type"),
+        Index("ix_background_jobs_status_created_at", "status", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    job_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    status: Mapped[JobStatus] = mapped_column(
+        SAEnum(
+            JobStatus,
+            name="job_status",
+            native_enum=False,
+            create_constraint=True,
+            length=32,
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=JobStatus.QUEUED,
+        server_default=text("'queued'"),
+    )
+    attempt: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=3,
+        server_default=text("3"),
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_traceback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utc_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utc_now,
+        onupdate=_utc_now,
+        server_default=func.now(),
+    )
