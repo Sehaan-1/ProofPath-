@@ -51,6 +51,7 @@ async def _run_worker(
         queue=queue,
         store=SqlAlchemyJobStore(session_factory),
         registry=registry,
+        backoff_schedule=settings.job_retry_backoff_seconds,
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

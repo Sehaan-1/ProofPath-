@@ -1,8 +1,8 @@
 """Redis Streams-backed job queue for ProofPath background workers.
 
-Sub-part 2.2.1b: a Redis Stream is the *transport* and a consumer group gives
-reliable, at-least-once delivery with a Pending Entries List (PEL) tracking
-unacked messages. The authoritative job *state* lives in the ``background_jobs``
+A Redis Stream is the *transport* and a consumer group gives reliable,
+at-least-once delivery with a Pending Entries List (PEL) tracking unacked
+messages. The authoritative job *state* lives in the ``background_jobs``
 PostgreSQL table (correlated by job id); stream messages only carry the job id,
 so Redis and PostgreSQL stay decoupled.
 
@@ -14,17 +14,17 @@ Primitives:
 * :meth:`JobQueue.ack` — acknowledge a processed message (removes it from the PEL).
 * :meth:`JobQueue.reclaim` — ``XAUTOCLAIM`` idle messages left behind by a
   crashed or stalled consumer, so work is never stranded in the PEL.
-
-Exponential backoff timing and a dead-letter *replay* mechanism arrive in
-Sub-slice 2.2.3; today a transient failure re-enqueues immediately and caps at
-``max_attempts`` (recorded on the job row) before the worker moves the row to
-``dead_letter``.
+* :meth:`JobQueue.schedule_retry` — place a transiently-failed job into a sorted
+  set keyed by its "ready-at" timestamp (Sub-part 2.2.3a exponential backoff).
+* :meth:`JobQueue.drain_ready_retries` — move jobs whose backoff has elapsed back
+  onto the stream for redelivery.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -34,10 +34,11 @@ from redis.exceptions import ResponseError
 
 logger = logging.getLogger(__name__)
 
-#: Default stream and consumer-group keys. A dedicated DB index (``REDIS_URL``
-#: path) keeps ProofPath queue traffic isolated from any other Redis usage.
+#: Default stream, consumer-group, and delayed-retry keys. A dedicated DB index
+#: (``REDIS_URL`` path) keeps ProofPath queue traffic isolated from other usage.
 DEFAULT_STREAM = "proofpath:jobs"
 DEFAULT_GROUP = "proofpath-workers"
+DEFAULT_DELAY_KEY = "proofpath:jobs:delayed"
 
 _JOB_ID_FIELD = "job_id"
 _JOB_TYPE_FIELD = "job_type"
@@ -56,6 +57,20 @@ class JobMessage:
     job_id: uuid.UUID | None
     job_type: str
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class RetryItem:
+    """A job scheduled for delayed re-enqueue after a transient failure.
+
+    The ``ready_at`` timestamp (Unix seconds) is the ZSET score; ``drain_ready_retries``
+    re-enqueues any item whose score is in the past.
+    """
+
+    job_id: uuid.UUID
+    job_type: str
+    payload: dict[str, Any]
+    ready_at: float
 
 
 def _parse_message(message_id: str, fields: dict[str, Any]) -> JobMessage:
@@ -106,11 +121,13 @@ class JobQueue:
         stream: str = DEFAULT_STREAM,
         group: str = DEFAULT_GROUP,
         consumer: str = "worker-1",
+        delay_key: str = DEFAULT_DELAY_KEY,
     ) -> None:
         self._redis = redis
         self._stream = stream
         self._group = group
         self._consumer = consumer
+        self._delay_key = delay_key
 
     @property
     def stream(self) -> str:
@@ -124,6 +141,10 @@ class JobQueue:
     def consumer(self) -> str:
         return self._consumer
 
+    @property
+    def delay_key(self) -> str:
+        return self._delay_key
+
     @classmethod
     def from_url(
         cls,
@@ -132,6 +153,7 @@ class JobQueue:
         stream: str = DEFAULT_STREAM,
         group: str = DEFAULT_GROUP,
         consumer: str = "worker-1",
+        delay_key: str = DEFAULT_DELAY_KEY,
     ) -> JobQueue:
         """Build a `JobQueue` backed by a new Redis client resolved from a URL."""
         return cls(
@@ -139,6 +161,7 @@ class JobQueue:
             stream=stream,
             group=group,
             consumer=consumer,
+            delay_key=delay_key,
         )
 
     async def ensure_group(self) -> None:
@@ -232,6 +255,88 @@ class JobQueue:
     async def stream_length(self) -> int:
         """Total entries in the stream (acked and pending)."""
         return int(await self._redis.xlen(self._stream))
+
+    # ------------------------------------------------------------------
+    # Delayed retry (Sub-part 2.2.3a — exponential backoff)
+    # ------------------------------------------------------------------
+
+    async def schedule_retry(
+        self,
+        job_id: uuid.UUID,
+        *,
+        job_type: str,
+        payload: dict[str, Any],
+        delay_seconds: float,
+    ) -> float:
+        """Schedule a transiently-failed job for delayed re-enqueue.
+
+        Stores the job in a Redis sorted set keyed by its "ready-at" Unix timestamp
+        (``now + delay_seconds``). The worker's idle loop drains ready items back
+        onto the stream via :meth:`drain_ready_retries`. This keeps the worker
+        productive during the backoff window (it does not block on a sleep) and the
+        retry survives a worker restart. Returns the computed ``ready_at`` score.
+        """
+        if delay_seconds < 0:
+            delay_seconds = 0
+        ready_at = time.time() + delay_seconds
+        member = json.dumps(
+            {
+                _JOB_ID_FIELD: str(job_id),
+                _JOB_TYPE_FIELD: job_type,
+                _PAYLOAD_FIELD: payload,
+            },
+            separators=(",", ":"),
+        )
+        await self._redis.zadd(self._delay_key, {member: ready_at})
+        return ready_at
+
+    async def drain_ready_retries(self, *, now: float | None = None) -> list[RetryItem]:
+        """Re-enqueue all delayed jobs whose backoff has elapsed; return them.
+
+        Atomically claims ready members with ``ZRANGEBYSCORE`` + ``ZREM`` so two
+        concurrent workers never re-enqueue the same retry. Each claimed item is
+        ``XADD``-ed back onto the stream as a fresh message for the consumer group.
+        """
+        timestamp = now if now is not None else time.time()
+        ready: Any = await self._redis.zrangebyscore(self._delay_key, 0, timestamp)
+        if not ready:
+            return []
+        # Claim atomically: remove the members we intend to re-enqueue.
+        removed = await self._redis.zrem(self._delay_key, *ready)
+        items: list[RetryItem] = []
+        for raw in ready[:removed]:
+            member = raw.decode() if isinstance(raw, bytes) else str(raw)
+            try:
+                decoded = json.loads(member)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Discarding corrupt delayed-retry member %r.", member)
+                continue
+            job_id_raw = decoded.get(_JOB_ID_FIELD)
+            try:
+                job_id = uuid.UUID(str(job_id_raw)) if job_id_raw else None
+            except (ValueError, TypeError):
+                logger.warning("Discarding delayed-retry member with bad job_id %r.", member)
+                continue
+            if job_id is None:
+                continue
+            payload = decoded.get(_PAYLOAD_FIELD, {})
+            if not isinstance(payload, dict):
+                payload = {}
+            items.append(
+                RetryItem(
+                    job_id=job_id,
+                    job_type=str(decoded.get(_JOB_TYPE_FIELD, "")),
+                    payload=payload,
+                    ready_at=timestamp,
+                )
+            )
+        for item in items:
+            await self.enqueue(item.job_id, job_type=item.job_type, payload=item.payload)
+        return items
+
+    async def delayed_count(self) -> int:
+        """Number of jobs currently waiting out their backoff window."""
+        return int(await self._redis.zcard(self._delay_key))
 
     async def close(self) -> None:
         """Close the underlying Redis client."""

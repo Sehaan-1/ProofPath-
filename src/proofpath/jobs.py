@@ -68,6 +68,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 GITHUB_INGEST_TASK = "github_ingest"
 ANALYSIS_RUN_TASK = "analysis_run"
 
+#: Default max attempts when the caller does not override; the worker bootstrap
+#: passes ``settings.job_max_attempts`` so the policy is centrally configured.
 _DEFAULT_MAX_ATTEMPTS = 3
 
 

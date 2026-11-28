@@ -1,23 +1,33 @@
 """Background worker that drains the Redis job queue and drives the job ledger.
 
-Sub-part 2.2.1b: the worker is the bridge between the Redis Stream (transport)
-and the ``background_jobs`` PostgreSQL table (state). For each message it:
+The worker is the bridge between the Redis Stream (transport) and the
+``background_jobs`` PostgreSQL table (state). For each message it:
 
 1. claims the job row and atomically moves it ``queued/failed -> running`` — a
    duplicate delivery can never re-run a finished job;
 2. dispatches a registered handler **outside** the DB transaction so long-running
    LLM/ingestion work never holds a connection;
-3. finalizes the row — ``succeeded`` on success, ``failed`` (then re-enqueued) on
-   a transient error, or ``dead_letter`` when retries are exhausted or a handler
-   reports a permanent error — and acks the Redis message.
+3. finalizes the row — ``succeeded`` on success, ``failed`` (then scheduled for a
+   **delayed** retry with exponential backoff) on a transient error, or
+   ``dead_letter`` when retries are exhausted or a handler reports a permanent
+   error — and acks the Redis message.
+
+Retry & dead-letter policy (Sub-slice 2.2.3):
+
+* **Exponential backoff** — a transient failure is not re-enqueued immediately;
+  it is placed in a Redis sorted set keyed by ``now + backoff_delay(attempt)``
+  and re-enqueued only once the backoff window elapses. The default schedule is
+  ``[2, 8, 30]`` seconds, indexed by the failed attempt number.
+* **Fail-fast on permanent errors** — a handler returning ``transient=False``
+  (validation errors, unknown task types, bad inputs) goes straight to
+  ``dead_letter`` with no delay or retry.
+* **Dead-letter audit trail** — when a job is dead-lettered an immutable
+  ``audit_logs`` entry is appended in the same transaction, capturing the error,
+  traceback, job type, and attempt budget.
 
 The DB interactions live behind a :class:`JobStore` protocol so the orchestration
 is unit-testable with an in-memory fake; :class:`SqlAlchemyJobStore` is the
 production implementation wrapping :class:`BackgroundJobRepo`.
-
-Exponential backoff timing and a dead-letter replay CLI are Sub-slice 2.2.3;
-today a transient failure re-enqueues immediately and the row caps at
-``max_attempts`` before moving to ``dead_letter``.
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ import asyncio
 import logging
 import traceback
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -34,11 +44,47 @@ from typing import Any, Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from proofpath.db.models import AuditActor
+from proofpath.db.repositories.audit import AuditRepo
 from proofpath.db.repositories.background_job import BackgroundJobRepo
 from proofpath.workers.queue import JobMessage, JobQueue
 from proofpath.workers.tasks import JobContext, JobResult, TaskRegistry
 
 logger = logging.getLogger(__name__)
+
+#: Default exponential backoff schedule (seconds), indexed by failed attempt.
+#: Attempt 1 fails -> wait 2s; attempt 2 fails -> wait 8s; attempt 3 fails ->
+#: wait 30s (only reached if ``max_attempts`` > 3).
+DEFAULT_BACKOFF_SCHEDULE: tuple[int, ...] = (2, 8, 30)
+
+#: Event type recorded on `audit_logs` when a job is pushed to dead_letter.
+DEAD_LETTER_AUDIT_EVENT = "background_job.dead_lettered"
+
+#: Maximum traceback characters persisted on a dead-lettered job / audit entry,
+#: to keep the row bounded. The tail is kept (most recent frame).
+_MAX_TRACEBACK_CHARS = 8_192
+
+
+def compute_backoff_delay(attempt: int, schedule: Sequence[int]) -> float:
+    """Return the backoff delay (seconds) for a transiently-failed attempt.
+
+    ``attempt`` is the 1-based attempt number that just failed. The delay is
+    ``schedule[attempt - 1]`` when available, else the last value in the schedule
+    (so a long schedule caps rather than overflowing). ``attempt <= 0`` returns 0.
+    """
+    if attempt <= 0 or not schedule:
+        return 0.0
+    index = min(attempt - 1, len(schedule) - 1)
+    return float(schedule[index])
+
+
+def _truncate_traceback(tb: str | None) -> str | None:
+    """Bound a traceback string to ``_MAX_TRACEBACK_CHARS``, keeping the tail."""
+    if tb is None:
+        return None
+    if len(tb) <= _MAX_TRACEBACK_CHARS:
+        return tb
+    return "...\n" + tb[-(_MAX_TRACEBACK_CHARS - 4) :]
 
 
 class ProcessOutcome(StrEnum):
@@ -161,8 +207,26 @@ class SqlAlchemyJobStore:
         self, job_id: uuid.UUID, *, error: str, traceback: str | None = None
     ) -> None:
         async with self._session() as session:
-            await BackgroundJobRepo(session).mark_dead_letter(
+            job = await BackgroundJobRepo(session).mark_dead_letter(
                 job_id, error=error, traceback=traceback
+            )
+            # Append an immutable audit entry in the same transaction so the
+            # dead-letter event is always accompanied by a queryable trail
+            # (Sub-part 2.2.3b). Captures the job type, attempt budget, and a
+            # bounded traceback for diagnosis.
+            details: dict[str, Any] = {"error": error}
+            if job is not None:
+                details["job_type"] = job.job_type
+                details["attempt"] = job.attempt
+                details["max_attempts"] = job.max_attempts
+            bounded_tb = _truncate_traceback(traceback)
+            if bounded_tb is not None:
+                details["traceback"] = bounded_tb
+            await AuditRepo(session).record(
+                actor=AuditActor.AGENT,
+                event_type=DEAD_LETTER_AUDIT_EVENT,
+                resource_id=job_id,
+                details_json=details,
             )
             await session.commit()
 
@@ -180,6 +244,7 @@ class Worker:
         batch_size: int = 1,
         reclaim_min_idle_ms: int = 60_000,
         reclaim_batch_size: int = 10,
+        backoff_schedule: Sequence[int] = DEFAULT_BACKOFF_SCHEDULE,
     ) -> None:
         self._queue = queue
         self._store = store
@@ -188,6 +253,7 @@ class Worker:
         self._batch_size = batch_size
         self._reclaim_min_idle_ms = reclaim_min_idle_ms
         self._reclaim_batch_size = reclaim_batch_size
+        self._backoff_schedule = tuple(backoff_schedule)
 
     async def process_once(self) -> BatchOutcome:
         """Block on the queue for one batch, process every message, return a tally."""
@@ -201,6 +267,22 @@ class Worker:
             count=self._reclaim_batch_size,
         )
         return await self._process_messages(messages)
+
+    async def process_ready_retries(self) -> int:
+        """Re-enqueue delayed-retry jobs whose backoff window has elapsed.
+
+        Returns the number of jobs moved back onto the stream. Called on idle
+        loop iterations so backoff-scheduled jobs are redelivered promptly without
+        blocking the worker during the delay.
+        """
+        try:
+            items = await self._queue.drain_ready_retries()
+        except Exception:
+            logger.exception("Failed to drain ready retries from the delay queue.")
+            return 0
+        if items:
+            logger.debug("Re-enqueued %d delayed-retry job(s).", len(items))
+        return len(items)
 
     async def _process_messages(self, messages: list[JobMessage]) -> BatchOutcome:
         dispatched = succeeded = failed = dead_lettered = skipped = 0
@@ -298,14 +380,26 @@ class Worker:
             await self._queue.ack(message.message_id)
             return _MessageResult.DEAD_LETTERED
 
-        # Transient failure with retries remaining: record it, re-enqueue, ack.
+        # Transient failure with retries remaining: record it, schedule a delayed
+        # retry with exponential backoff, and ack the current stream message. The
+        # job is placed in a Redis sorted set keyed by ready-at; the idle loop
+        # re-enqueues it onto the stream once the backoff window elapses.
+        delay = compute_backoff_delay(claimed.attempt, self._backoff_schedule)
         await self._store.fail(claimed.job_id, error=error, traceback=result.traceback)
-        await self._queue.enqueue(
+        await self._queue.schedule_retry(
             claimed.job_id,
             job_type=claimed.job_type,
             payload=claimed.payload,
+            delay_seconds=delay,
         )
         await self._queue.ack(message.message_id)
+        logger.info(
+            "Job %s (type %s) attempt %d failed transiently; scheduled retry in %.1fs.",
+            claimed.job_id,
+            claimed.job_type,
+            claimed.attempt,
+            delay,
+        )
         return _MessageResult.FAILED
 
     async def run(
@@ -318,8 +412,9 @@ class Worker:
         """Run the consume loop until cancelled, stopped, or ``max_iterations`` reached.
 
         ``process_once`` blocks on Redis for ``block_ms``, so the loop only spins
-        when the queue is actually idle. On idle iterations it reclaims stranded
-        PEL messages (crashed-consumer recovery) before a short sleep.
+        when the queue is actually idle. On idle iterations it: drains
+        backoff-scheduled retries back onto the stream, reclaims stranded PEL
+        messages (crashed-consumer recovery), then sleeps briefly.
         """
         await self._queue.ensure_group()
         iterations = 0
@@ -330,6 +425,7 @@ class Worker:
                 outcome = await self.process_once()
                 iterations += 1
                 if outcome.outcome is ProcessOutcome.IDLE:
+                    await self.process_ready_retries()
                     await self.reclaim_stale()
                     if stop_event is not None and stop_event.is_set():
                         break

@@ -116,10 +116,30 @@ permanent error (`transient=False`) or an unknown task type fails straight to
 (`SqlAlchemyJobStore` is the production implementation) so the orchestration is
 fully unit-tested without a database.
 
-Exponential backoff timing (2s → 8s → 30s) and a dead-letter replay CLI arrive in
-Sub-slice 2.2.3. The registry ships two built-in smoke-test tasks — `noop`
-(succeeds immediately) and `echo` (returns its payload) — plus the real
-offloaded-work handlers below.
+The registry ships two built-in smoke-test tasks — `noop` (succeeds immediately)
+and `echo` (returns its payload) — plus the real offloaded-work handlers below.
+
+### Retry & Dead-Letter Policy (Slice 2.2.3)
+
+**Exponential backoff.** A transiently-failed job is not re-enqueued immediately.
+It is placed in a Redis sorted set keyed by its "ready-at" timestamp
+(`now + backoff_delay`), and the worker's idle loop drains ready items back onto
+the stream via `drain_ready_retries`. This keeps the worker productive during the
+backoff window (no blocking sleep) and survives a worker restart. The default
+schedule is `JOB_RETRY_BACKOFF_SECONDS=[2, 8, 30]` seconds, indexed by the failed
+attempt number; `JOB_MAX_ATTEMPTS=3` caps the total attempts. Both are
+configurable via `.env`. A handler returning `transient=False` (validation errors,
+unknown task types, bad inputs, permanent HTTP 4xx) goes **straight to
+`dead_letter`** with no delay or retry — only transient HTTP/LLM errors
+(429/5xx/network/timeout) are retried.
+
+**Dead-letter audit trail.** When a job is pushed to `dead_letter` (retries
+exhausted or a permanent error), an immutable `audit_logs` entry
+(`event_type="background_job.dead_lettered"`, `actor="agent"`) is appended in the
+*same PostgreSQL transaction* as the status transition, capturing the error
+message, job type, attempt budget, and a bounded traceback (≤ 8 KiB, tail kept).
+This makes every terminal failure queryable via the audit log independently of
+the `background_jobs` row.
 
 ### Async Workflows & Job Status (Slice 2.2.2)
 

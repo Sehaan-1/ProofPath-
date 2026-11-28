@@ -110,6 +110,11 @@ class FakeQueue:
     reclaim_messages: list[JobMessage] = field(default_factory=list)
     acked: list[str] = field(default_factory=list)
     enqueued: list[tuple[uuid.UUID, str, dict[str, Any]]] = field(default_factory=list)
+    scheduled_retries: list[tuple[uuid.UUID, str, dict[str, Any], float]] = field(
+        default_factory=list
+    )
+    ready_retries: list[JobMessage] = field(default_factory=list)
+    drained: bool = False
     consumer: str = "fake-worker"
     _ensured_group: bool = False
 
@@ -129,6 +134,23 @@ class FakeQueue:
         mid = f"re-{len(self.enqueued)}"
         self.enqueued.append((job_id, job_type, payload))
         return mid
+
+    async def schedule_retry(
+        self,
+        job_id: uuid.UUID,
+        *,
+        job_type: str,
+        payload: dict[str, Any],
+        delay_seconds: float,
+    ) -> float:
+        self.scheduled_retries.append((job_id, job_type, payload, delay_seconds))
+        return delay_seconds
+
+    async def drain_ready_retries(self, *, now: float | None = None) -> list:
+        self.drained = True
+        out = list(self.ready_retries)
+        self.ready_retries = []
+        return out
 
     async def reclaim(self, *, min_idle_ms: int = 60_000, count: int = 10) -> list[JobMessage]:
         out = list(self.reclaim_messages)
@@ -298,28 +320,33 @@ async def test_unknown_task_type_goes_straight_to_dead_letter() -> None:
 
 
 @pytest.mark.unit
-async def test_transient_failure_re_enqueues_until_max_attempts_then_dead_letter() -> None:
+async def test_transient_failure_schedules_delayed_retry_then_dead_letter() -> None:
     store = FakeJobStore({JID: FakeJob(JID, "flaky", {}, JobStatus.QUEUED, max_attempts=2)})
     registry = TaskRegistry()
     registry.register("flaky", _always_fail)
-    worker = Worker(queue=FakeQueue(), store=store, registry=registry)
+    worker = Worker(queue=FakeQueue(), store=store, registry=registry, backoff_schedule=(2, 8, 30))
 
-    # First delivery: attempt 1 (< max 2) -> failed + re-enqueue.
+    # First delivery: attempt 1 (< max 2) -> failed + delayed retry scheduled.
     worker._queue.messages = [_msg(JID, "flaky", message_id="m1")]  # type: ignore[attr-defined]
     out1 = await worker.process_once()
     assert out1.failed == 1
     assert store.jobs[JID].status is JobStatus.FAILED
     assert store.jobs[JID].attempt == 1
-    assert len(worker._queue.enqueued) == 1  # type: ignore[attr-defined]
+    # Retry is delayed (scheduled_retry), not immediately enqueued.
+    assert worker._queue.enqueued == []  # type: ignore[attr-defined]
+    assert len(worker._queue.scheduled_retries) == 1  # type: ignore[attr-defined]
+    scheduled = worker._queue.scheduled_retries[0]  # type: ignore[attr-defined]
+    assert scheduled[0] == JID
+    assert scheduled[3] == 2.0  # backoff delay for attempt 1 is 2s
     assert worker._queue.acked == ["m1"]  # type: ignore[attr-defined]
 
-    # Second delivery: attempt 2 (>= max 2) -> dead_letter, no further re-enqueue.
+    # Second delivery: attempt 2 (>= max 2) -> dead_letter, no retry scheduled.
     worker._queue.messages = [_msg(JID, "flaky", message_id="m2")]  # type: ignore[attr-defined]
     out2 = await worker.process_once()
     assert out2.dead_lettered == 1
     assert store.jobs[JID].status is JobStatus.DEAD_LETTER
     assert store.jobs[JID].attempt == 2
-    assert len(worker._queue.enqueued) == 1  # type: ignore[attr-defined]
+    assert len(worker._queue.scheduled_retries) == 1  # type: ignore[attr-defined]
     assert worker._queue.acked == ["m1", "m2"]  # type: ignore[attr-defined]
 
 
@@ -328,14 +355,20 @@ async def test_max_attempts_one_exhausts_on_first_failure() -> None:
     store = FakeJobStore({JID: FakeJob(JID, "flaky", {}, JobStatus.QUEUED, max_attempts=1)})
     registry = TaskRegistry()
     registry.register("flaky", _always_fail)
-    worker = Worker(queue=FakeQueue(messages=[_msg(JID, "flaky")]), store=store, registry=registry)
+    worker = Worker(
+        queue=FakeQueue(messages=[_msg(JID, "flaky")]),
+        store=store,
+        registry=registry,
+        backoff_schedule=(2, 8, 30),
+    )
 
     outcome = await worker.process_once()
 
     assert outcome.dead_lettered == 1
     assert store.jobs[JID].status is JobStatus.DEAD_LETTER
     assert store.jobs[JID].attempt == 1
-    assert len(worker._queue.enqueued) == 0  # type: ignore[attr-defined]
+    assert worker._queue.scheduled_retries == []  # type: ignore[attr-defined]
+    assert worker._queue.enqueued == []  # type: ignore[attr-defined]
 
 
 @pytest.mark.unit
