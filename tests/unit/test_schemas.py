@@ -23,15 +23,19 @@ from proofpath.db.models import (
 )
 from proofpath.schemas import (
     TOOL_INPUT_REGISTRY,
+    ActionDraftCreationResponse,
     ActionDraftRecord,
     AnalysisReport,
     AnalysisRunCreateRequest,
     ApproveActionInput,
     CalendarBlockPayload,
+    CalendarTaskRecord,
     ClaimVerdictSchema,
     ContributionSprintPayload,
     ContributionSprintPlan,
     CreateActionDraftInput,
+    DraftDecisionResponse,
+    DraftExecutionResponse,
     EvidenceSearchRequest,
     EvidenceSnippet,
     GetActionDraftInput,
@@ -448,6 +452,177 @@ def test_analysis_run_create_request_defaults() -> None:
     request = AnalysisRunCreateRequest.model_validate({"opportunity_id": str(_OPP_ID)})
     assert request.async_run is False
     _assert_extra_forbidden(AnalysisRunCreateRequest, {"opportunity_id": str(_OPP_ID)})
+
+
+@pytest.mark.unit
+def test_draft_decision_response_contract() -> None:
+    payload = {
+        "draft": {
+            "id": str(_DRAFT_ID),
+            "analysis_run_id": str(_RUN_ID),
+            "action_type": "tracker_upsert",
+            "status": "approved",
+            "payload": {
+                "action_type": "tracker_upsert",
+                "opportunity_id": str(_OPP_ID),
+                "stage": "preparing",
+            },
+            "idempotency_key": f"proofpath:{_RUN_ID}:tracker_upsert",
+            "approved_at": "2026-01-01T00:00:00Z",
+        },
+        "decision": "approved",
+        "already_processed": True,
+        "run_status": "completed",
+        "thread_id": "thread-1",
+    }
+    response = DraftDecisionResponse.model_validate(payload)
+    assert response.already_processed is True
+    assert response.run_status is AnalysisRunStatus.COMPLETED
+    assert response.draft.id == _DRAFT_ID
+
+    for decision in ("approved", "rejected"):
+        assert (
+            DraftDecisionResponse.model_validate(payload | {"decision": decision}).decision
+            == decision
+        )
+    with pytest.raises(ValidationError):
+        DraftDecisionResponse.model_validate(payload | {"decision": "maybe"})
+    with pytest.raises(ValidationError):
+        DraftDecisionResponse.model_validate(payload | {"run_status": "pending"})
+    with pytest.raises(ValidationError):
+        DraftDecisionResponse.model_validate(payload | {"thread_id": ""})
+    _assert_extra_forbidden(DraftDecisionResponse, payload)
+
+
+@pytest.mark.unit
+def test_action_draft_creation_response_is_always_pending() -> None:
+    draft = {
+        "id": str(_DRAFT_ID),
+        "analysis_run_id": str(_RUN_ID),
+        "action_type": "tracker_upsert",
+        "status": "pending_approval",
+        "payload": {
+            "action_type": "tracker_upsert",
+            "opportunity_id": str(_OPP_ID),
+            "stage": "preparing",
+        },
+        "idempotency_key": f"proofpath:{_RUN_ID}:tracker_upsert",
+        "approved_at": None,
+        "executed_at": None,
+    }
+    payload = {"draft": draft, "created": True}
+
+    response = ActionDraftCreationResponse.model_validate(payload)
+    assert response.created is True
+    assert response.requires_approval is True
+    assert response.draft.status is ActionDraftStatus.PENDING_APPROVAL
+
+    # Only a fresh insert reports created=True; an existing draft is returned as-is.
+    assert ActionDraftCreationResponse.model_validate(payload | {"created": False}).created is False
+
+    # The tool is side-effect free by contract: it can never report an executed draft.
+    with pytest.raises(ValidationError, match="pending_approval"):
+        ActionDraftCreationResponse.model_validate(
+            {"draft": draft | {"status": "executed"}, "created": True}
+        )
+    with pytest.raises(ValidationError, match="requires_approval"):
+        ActionDraftCreationResponse.model_validate(payload | {"requires_approval": False})
+    _assert_extra_forbidden(ActionDraftCreationResponse, payload)
+
+
+@pytest.mark.unit
+def test_draft_decision_response_accepts_an_execution_report() -> None:
+    payload = {
+        "draft": {
+            "id": str(_DRAFT_ID),
+            "analysis_run_id": str(_RUN_ID),
+            "action_type": "tracker_upsert",
+            "status": "executed",
+            "payload": {
+                "action_type": "tracker_upsert",
+                "opportunity_id": str(_OPP_ID),
+                "stage": "preparing",
+            },
+            "idempotency_key": f"proofpath:{_RUN_ID}:tracker_upsert",
+            "approved_at": "2026-01-01T00:00:00Z",
+            "executed_at": "2026-01-01T00:00:05Z",
+        },
+        "decision": "approved",
+        "already_processed": False,
+        "run_status": "completed",
+        "thread_id": "thread-1",
+        "execution": {
+            "draft_id": str(_DRAFT_ID),
+            "action_type": "tracker_upsert",
+            "outcome": "executed",
+            "approved_at": "2026-01-01T00:00:00Z",
+            "executed_at": "2026-01-01T00:00:05Z",
+            "audit_log_id": str(uuid.uuid4()),
+        },
+    }
+
+    response = DraftDecisionResponse.model_validate(payload)
+
+    assert response.execution is not None
+    assert response.execution.outcome == "executed"
+    assert response.execution.error_code is None
+    assert DraftDecisionResponse.model_validate(payload | {"execution": None}).execution is None
+
+
+@pytest.mark.unit
+def test_draft_execution_response_validates_its_outcome_contract() -> None:
+    base = {
+        "draft_id": str(_DRAFT_ID),
+        "action_type": "calendar_block",
+        "outcome": "executed",
+        "approved_at": "2026-01-01T00:00:00Z",
+        "executed_at": "2026-01-01T00:00:05Z",
+        "calendar_task_id": str(uuid.uuid4()),
+    }
+    record = DraftExecutionResponse.model_validate(base)
+    assert record.outcome == "executed"
+
+    # `already_executed` replays carry no new executed_at but stay valid.
+    replay = DraftExecutionResponse.model_validate(
+        base | {"outcome": "already_executed", "executed_at": None}
+    )
+    assert replay.outcome == "already_executed"
+
+    # Failures must name a reason and must not pretend anything executed.
+    failed = DraftExecutionResponse.model_validate(
+        base | {"outcome": "failed", "executed_at": None, "error_code": "invalid_payload"}
+    )
+    assert failed.error_code == "invalid_payload"
+    with pytest.raises(ValidationError, match="error_code"):
+        DraftExecutionResponse.model_validate(base | {"outcome": "failed", "executed_at": None})
+    with pytest.raises(ValidationError, match="executed_at"):
+        DraftExecutionResponse.model_validate(base | {"outcome": "failed", "error_code": "x"})
+    with pytest.raises(ValidationError, match="error_code"):
+        DraftExecutionResponse.model_validate(base | {"error_code": "x"})
+    with pytest.raises(ValidationError):
+        DraftExecutionResponse.model_validate(base | {"outcome": "succeeded"})
+    _assert_extra_forbidden(DraftExecutionResponse, base)
+
+
+@pytest.mark.unit
+def test_calendar_task_record_contract() -> None:
+    payload = {
+        "id": str(uuid.uuid4()),
+        "action_draft_id": str(_DRAFT_ID),
+        "opportunity_id": str(_OPP_ID),
+        "title": "Interview prep block",
+        "description": None,
+        "start_at": "2026-12-01T09:00:00Z",
+        "end_at": "2026-12-01T10:30:00Z",
+        "timezone": "Asia/Kolkata",
+        "ics_uid": f"proofpath-{_DRAFT_ID}@proofpath.local",
+        "created_at": "2026-11-28T11:00:00Z",
+        "invite_url": f"/api/v1/calendar-tasks/{_DRAFT_ID}/invite.ics",
+    }
+    record = CalendarTaskRecord.model_validate(payload)
+    assert record.timezone == "Asia/Kolkata"
+    assert record.ics_uid.startswith("proofpath-")
+    _assert_extra_forbidden(CalendarTaskRecord, payload)
 
 
 @pytest.mark.unit

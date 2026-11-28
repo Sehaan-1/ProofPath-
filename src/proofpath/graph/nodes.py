@@ -23,7 +23,7 @@ from proofpath.db.models import (
     RequirementPriority,
     VerdictType,
 )
-from proofpath.db.repositories.draft import DraftRepo
+from proofpath.db.repositories.draft import DraftRepo, draft_record
 from proofpath.db.repositories.opportunity import OpportunityRepo, RoleRequirementInput
 from proofpath.db.repositories.tracker import TrackerRepo
 from proofpath.graph.state import PolicyViolation, ProofPathState
@@ -35,7 +35,6 @@ from proofpath.schemas.actions import (
     CalendarBlockPayload,
     ContributionSprintPlan,
     TrackerUpsertPayload,
-    parse_action_draft_payload,
 )
 from proofpath.schemas.analysis import ClaimVerdictSchema
 from proofpath.schemas.evidence import EvidenceSnippet
@@ -416,16 +415,5 @@ async def create_action_drafts_node(
         )
         if row.analysis_run_id != analysis_run_id or row.action_type != payload.action_type:
             raise ValueError("Draft idempotency key conflict")
-        records.append(
-            ActionDraftRecord(
-                id=row.id,
-                analysis_run_id=row.analysis_run_id,
-                action_type=row.action_type,
-                status=row.status,
-                payload=parse_action_draft_payload(row.payload_json),
-                idempotency_key=row.idempotency_key,
-                approved_at=row.approved_at,
-                executed_at=row.executed_at,
-            )
-        )
+        records.append(draft_record(row))
     return {"draft_actions": records, "step_count": state.get("step_count", 0) + 1}

@@ -8,7 +8,7 @@ from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import AwareDatetime, Field, TypeAdapter, field_validator, model_validator
 
-from proofpath.db.models import ActionDraftStatus, ActionType, ApplicationStage
+from proofpath.db.models import ActionDraftStatus, ActionType, AnalysisRunStatus, ApplicationStage
 from proofpath.schemas.base import StrictModel
 
 _MAX_NOTES = 8000
@@ -156,6 +156,85 @@ class ActionDraftRecord(StrictModel):
     executed_at: AwareDatetime | None = None
 
 
+DraftDecision: TypeAlias = Literal["approved", "rejected"]
+
+ExecutionOutcomeName: TypeAlias = Literal["executed", "already_executed", "failed"]
+
+
+class DraftExecutionResponse(StrictModel):
+    """Approved-only side effect performed for one draft (Sub-slice 2.1.3).
+
+    `outcome='executed'` means this request materialized the side effect;
+    `already_executed` means it was already in place (retry/replay, no second
+    effect); `failed` means the executor refused or errored and nothing was written.
+    """
+
+    draft_id: uuid.UUID
+    action_type: ActionType
+    outcome: ExecutionOutcomeName
+    approved_at: AwareDatetime | None = Field(
+        default=None,
+        description="Human approval timestamp carried into the audit record.",
+    )
+    executed_at: AwareDatetime | None = Field(
+        default=None,
+        description="When the side effect was materialized (drafts.executed_at).",
+    )
+    audit_log_id: uuid.UUID | None = Field(
+        default=None,
+        description="Immutable `audit_logs` entry recording this execution.",
+    )
+    calendar_task_id: uuid.UUID | None = Field(
+        default=None,
+        description="Local `calendar_tasks` row for an executed `calendar_block` draft.",
+    )
+    error_code: str | None = Field(
+        default=None,
+        description="Stable failure reason when `outcome='failed'`.",
+    )
+    error_message: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_outcome_fields(self) -> Self:
+        if self.outcome == "failed":
+            if self.error_code is None:
+                raise ValueError("outcome='failed' requires an error_code.")
+            if self.executed_at is not None:
+                raise ValueError("outcome='failed' must not report an executed_at.")
+        elif self.error_code is not None:
+            raise ValueError("error_code is only valid when outcome='failed'.")
+        return self
+
+
+class DraftDecisionResponse(StrictModel):
+    """Result of approving or rejecting one action draft (Sub-slice 2.1.2)."""
+
+    draft: ActionDraftRecord
+    decision: DraftDecision
+    already_processed: bool = Field(
+        description=(
+            "True when an earlier request already applied this decision; the "
+            "draft and its run are returned unchanged instead of being re-executed."
+        ),
+    )
+    run_status: AnalysisRunStatus = Field(
+        description="Analysis run status after the decision, i.e. after the resume.",
+    )
+    thread_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="LangGraph thread the decision was resumed on.",
+    )
+    execution: DraftExecutionResponse | None = Field(
+        default=None,
+        description=(
+            "Approved-only side effect performed for this draft (Sub-slice 2.1.3). "
+            "Always null for rejections, and null when the draft is in a state the "
+            "executor refuses (for example a previously failed execution)."
+        ),
+    )
+
+
 class TrackerRecord(StrictModel):
     """API response for a personal application-tracker entry."""
 
@@ -164,6 +243,54 @@ class TrackerRecord(StrictModel):
     stage: ApplicationStage
     notes: str | None = None
     updated_at: datetime
+
+
+class ActionDraftCreationResponse(StrictModel):
+    """Result of the side-effect-free `create_action_draft` tool (Sub-slice 2.1.4).
+
+    Only a `pending_approval` row is persisted: no tracker entry, calendar block,
+    or audit record is written until a human approves the draft.
+    """
+
+    draft: ActionDraftRecord
+    created: bool = Field(
+        description=(
+            "True when this call inserted the draft. False means an identical draft "
+            "already existed for the same idempotency_key and was returned unchanged."
+        ),
+    )
+    requires_approval: bool = Field(
+        default=True,
+        description="Always True: the draft is pending and no side effect has run.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_requires_approval(self) -> Self:
+        if not self.requires_approval:
+            raise ValueError(
+                "create_action_draft never executes; requires_approval is always True."
+            )
+        if self.draft.status is not ActionDraftStatus.PENDING_APPROVAL:
+            raise ValueError("create_action_draft only returns pending_approval drafts.")
+        return self
+
+
+class CalendarTaskRecord(StrictModel):
+    """API response for a local calendar task materialized from an approved draft."""
+
+    id: uuid.UUID
+    action_draft_id: uuid.UUID
+    opportunity_id: uuid.UUID
+    title: str
+    description: str | None = None
+    start_at: AwareDatetime
+    end_at: AwareDatetime
+    timezone: str
+    ics_uid: str = Field(
+        description="Stable iCalendar UID; the same draft always yields the same invite.",
+    )
+    created_at: AwareDatetime
+    invite_url: str = Field(description="Downloadable `.ics` invite for this task.")
 
 
 class ApplicationStatusResponse(StrictModel):

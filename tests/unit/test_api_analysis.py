@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from langgraph.types import Interrupt
 
 from proofpath.api import analysis_routes, routes
 from proofpath.config import Settings
@@ -17,6 +18,7 @@ from proofpath.db.models import (
     RequirementPriority,
     VerdictType,
 )
+from proofpath.graph.state import ApprovalDraftSummary, ApprovalRequest
 from proofpath.main import create_app
 from proofpath.schemas.analysis import ClaimVerdictSchema
 
@@ -104,15 +106,30 @@ def app_services(monkeypatch):
             ]
 
     monkeypatch.setattr(analysis_routes, "AnalysisRepo", Repo)
-    monkeypatch.setattr(analysis_routes, "create_role_parser", lambda _settings: object())
-    monkeypatch.setattr(analysis_routes, "create_embedding_client", lambda _settings: object())
-    monkeypatch.setattr(analysis_routes, "create_graph_backend", lambda _settings: object())
+
+    class FakeDependencies:
+        parser = embedder = comparator = sprint_planner = object()
+
+    monkeypatch.setattr(
+        analysis_routes, "create_graph_dependencies", lambda _settings: FakeDependencies()
+    )
+    approval_interrupt = Interrupt(
+        value=ApprovalRequest(
+            analysis_run_id=uuid4(),
+            drafts=[
+                ApprovalDraftSummary(
+                    draft_id=uuid4(), action_type="tracker_upsert", summary="Update tracker"
+                )
+            ],
+        ).model_dump(mode="json")
+    )
     graph = MagicMock()
     graph.ainvoke = AsyncMock(
         return_value={
             "policy_verified": True,
             "errors": [],
             "draft_actions": [object()],
+            "__interrupt__": (approval_interrupt,),
             "verdicts": [
                 ClaimVerdictSchema(
                     requirement_id=req_id,
@@ -147,6 +164,21 @@ def test_analysis_run_persists_only_verified_verdicts_and_report(app_services):
     assert client.get(f"/api/v1/analyses/{run_id}").json()["verdicts"] == report["verdicts"]
     graph.ainvoke.assert_awaited_once()
     assert client.get(f"/api/v1/analyses/{uuid4()}").status_code == 404
+
+
+def test_pause_outside_approval_gate_is_failed_not_approvable(app_services):
+    client, graph, runs, opp_id, _, _ = app_services
+    graph.ainvoke.return_value = {
+        "policy_verified": True,
+        "errors": [],
+        "draft_actions": [object()],
+        "__interrupt__": (Interrupt(value="continue?"),),
+        "verdicts": [],
+    }
+    response = client.post("/api/v1/analyses/run", json={"opportunity_id": str(opp_id)})
+    assert response.status_code == 201
+    assert response.json()["status"] == "failed"
+    assert next(iter(runs.values())).status == AnalysisRunStatus.FAILED
 
 
 def test_graph_failure_is_failed_and_never_persists_unverified_verdicts(app_services):

@@ -15,6 +15,8 @@ from proofpath.policy.ledger_validator import (
     chunk_supports_entity,
 )
 from proofpath.policy.tool_allowlist import (
+    ALL_TOOL_NAMES,
+    APPROVAL_CONFIRMATION_PHRASE,
     APPROVAL_GATED_TOOL_NAMES,
     FORBIDDEN_TOOL_NAMES,
     READ_ONLY_TOOL_NAMES,
@@ -31,6 +33,8 @@ from proofpath.policy.tool_allowlist import (
 )
 
 __all__ = [
+    "ALL_TOOL_NAMES",
+    "APPROVAL_CONFIRMATION_PHRASE",
     "APPROVAL_GATED_TOOL_NAMES",
     "CITATION_MISSING_EVENT",
     "CLAIM_DOWNGRADED_EVENT",

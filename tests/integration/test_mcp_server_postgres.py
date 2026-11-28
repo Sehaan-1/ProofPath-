@@ -38,7 +38,11 @@ from proofpath.db.repositories.opportunity import OpportunityRepo, RoleRequireme
 from proofpath.db.repositories.tracker import TrackerRepo
 from proofpath.db.session import create_db_engine, create_session_factory
 from proofpath.mcp_server import create_mcp_server, create_streamable_http_app
-from proofpath.policy.tool_allowlist import FORBIDDEN_TOOL_NAMES, READ_ONLY_TOOL_NAMES
+from proofpath.policy.tool_allowlist import (
+    ALL_TOOL_NAMES,
+    FORBIDDEN_TOOL_NAMES,
+    READ_ONLY_TOOL_NAMES,
+)
 from proofpath.retrieval import EmbeddingClient, HashEmbeddingBackend
 from proofpath.schemas import (
     TOOL_INPUT_REGISTRY,
@@ -201,7 +205,12 @@ async def test_mcp_client_lists_tools_validates_schemas_and_searches_seeded_post
         # 1) List tools and validate JSON schemas.
         listed = await client.list_tools()
         tools_by_name = {tool.name: tool for tool in listed.tools}
-        assert set(tools_by_name) == set(READ_ONLY_TOOL_NAMES)
+        # Read-only tools plus the two approval-gated tools (Sub-slice 2.1.4).
+        assert set(tools_by_name) == set(ALL_TOOL_NAMES)
+        assert set(tools_by_name) == set(READ_ONLY_TOOL_NAMES) | {
+            "create_action_draft",
+            "approve_action",
+        }
         assert set(tools_by_name).isdisjoint(FORBIDDEN_TOOL_NAMES)
 
         for name, tool in tools_by_name.items():
@@ -364,7 +373,7 @@ async def test_mcp_stdio_and_streamable_http_transports_search_postgres(
         )
         async with Client(stdio_params) as stdio_client_conn:
             stdio_tools = await stdio_client_conn.list_tools()
-            assert {t.name for t in stdio_tools.tools} == set(READ_ONLY_TOOL_NAMES)
+            assert {t.name for t in stdio_tools.tools} == set(ALL_TOOL_NAMES)
             stdio_res = await stdio_client_conn.call_tool(
                 "search_evidence", {"query": unique_token, "top_k": 3}
             )
@@ -393,7 +402,7 @@ async def test_mcp_stdio_and_streamable_http_transports_search_postgres(
             await asyncio.wait_for(ready.wait(), timeout=5.0)
             async with Client(f"http://127.0.0.1:{port}/mcp") as http_client_conn:
                 http_tools = await http_client_conn.list_tools()
-                assert {t.name for t in http_tools.tools} == set(READ_ONLY_TOOL_NAMES)
+                assert {t.name for t in http_tools.tools} == set(ALL_TOOL_NAMES)
                 http_res = await http_client_conn.call_tool(
                     "search_evidence", {"query": unique_token, "top_k": 3}
                 )

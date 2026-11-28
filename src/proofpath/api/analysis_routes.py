@@ -14,14 +14,13 @@ from proofpath.api.routes import Session
 from proofpath.config import LLMProvider
 from proofpath.db.models import AnalysisRunStatus
 from proofpath.db.repositories.analysis import AnalysisRepo, ClaimVerdictInput
+from proofpath.db.repositories.draft import draft_record
 from proofpath.db.repositories.opportunity import OpportunityRepo
-from proofpath.graph.backends import create_graph_backend
+from proofpath.graph.approval import approval_request_from_interrupts
 from proofpath.graph.checkpointer import thread_config
+from proofpath.graph.dependencies import GraphDependenciesError, create_graph_dependencies
 from proofpath.graph.state import initial_state
 from proofpath.graph.workflow import build_workflow
-from proofpath.ingestion.analyse_role import create_role_parser
-from proofpath.retrieval.embeddings import create_embedding_client
-from proofpath.schemas.actions import ActionDraftRecord, parse_action_draft_payload
 from proofpath.schemas.analysis import AnalysisReport, AnalysisRunCreateRequest, ClaimVerdictSchema
 from proofpath.schemas.opportunity import ParsedRole, RequirementItem, RequirementRecord
 
@@ -37,10 +36,8 @@ async def run_analysis(payload: AnalysisRunCreateRequest, request: Request) -> A
     if settings.llm_provider is not LLMProvider.OPENAI:
         raise HTTPException(501, "Analysis currently requires the OpenAI model provider.")
     try:
-        parser = create_role_parser(settings)
-        embedder = create_embedding_client(settings)
-        backend = create_graph_backend(settings)
-    except ValueError as exc:
+        dependencies = create_graph_dependencies(settings)
+    except GraphDependenciesError as exc:
         raise HTTPException(503, "Analysis model is not configured.") from exc
     factory = request.app.state.session_factory
     thread_id = str(uuid.uuid4())
@@ -59,10 +56,10 @@ async def run_analysis(payload: AnalysisRunCreateRequest, request: Request) -> A
             settings=settings,
             analysis_run_id=run_id,
             thread_id=thread_id,
-            parser=parser,
-            embedder=embedder,
-            comparator=backend,
-            sprint_planner=backend,
+            parser=dependencies.parser,
+            embedder=dependencies.embedder,
+            comparator=dependencies.comparator,
+            sprint_planner=dependencies.sprint_planner,
             calendar_start=payload.calendar_start,
             calendar_end=payload.calendar_end,
         )
@@ -71,15 +68,17 @@ async def run_analysis(payload: AnalysisRunCreateRequest, request: Request) -> A
         )
         errors = state.get("errors", [])
         verified = state.get("policy_verified", False)
-        status = (
-            AnalysisRunStatus.FAILED
-            if errors or not verified
-            else (
-                AnalysisRunStatus.AWAITING_APPROVAL
-                if state.get("draft_actions")
-                else AnalysisRunStatus.COMPLETED
-            )
+        interrupts = state.get("__interrupt__") or ()
+        paused_for_approval = approval_request_from_interrupts(interrupts) is not None and bool(
+            state.get("draft_actions")
         )
+        if errors or not verified or (interrupts and not paused_for_approval):
+            # A pause anywhere other than the approval gate is not approvable.
+            status = AnalysisRunStatus.FAILED
+        elif paused_for_approval:
+            status = AnalysisRunStatus.AWAITING_APPROVAL
+        else:
+            status = AnalysisRunStatus.COMPLETED
         async with factory.begin() as session:
             repo = AnalysisRepo(session)
             if verified:
@@ -171,19 +170,7 @@ async def _get_report(run_id: uuid.UUID, request: Request, session: AsyncSession
                 "retryable": False,
             }
         ]
-    drafts = [
-        ActionDraftRecord(
-            id=d.id,
-            analysis_run_id=d.analysis_run_id,
-            action_type=d.action_type,
-            status=d.status,
-            payload=parse_action_draft_payload(d.payload_json),
-            idempotency_key=d.idempotency_key,
-            approved_at=d.approved_at,
-            executed_at=d.executed_at,
-        )
-        for d in run.action_drafts
-    ]
+    drafts = [draft_record(d) for d in run.action_drafts]
     verdicts = [ClaimVerdictSchema.model_validate(v) for v in run.claim_verdicts]
     return AnalysisReport(
         analysis_run_id=run.id,

@@ -14,6 +14,11 @@ from typing import Final
 from proofpath.schemas.base import StrictModel
 from proofpath.schemas.tools import TOOL_INPUT_REGISTRY
 
+# The exact phrase a human (or their client) must pass to `approve_action`.
+# Confirmation is deliberately explicit: the tool refuses to execute anything
+# without it, even when the draft is a perfectly valid `pending_approval` row.
+APPROVAL_CONFIRMATION_PHRASE: Final[str] = "approve action"
+
 
 class ToolAccess(StrEnum):
     """How a registered tool is allowed to run."""
@@ -122,7 +127,8 @@ APPROVAL_GATED_TOOLS: Final[tuple[ToolSpec, ...]] = (
     _spec(
         ToolName.APPROVE_ACTION,
         ToolAccess.APPROVAL_GATED,
-        "Execute an approved action draft only after an explicit confirmation phrase.",
+        "Execute one pending_approval action draft (tracker/calendar side effect plus "
+        f"audit record) only after the explicit confirmation phrase {APPROVAL_CONFIRMATION_PHRASE!r}.",
         requires_confirmation=True,
     ),
 )
@@ -135,6 +141,8 @@ READ_ONLY_TOOL_NAMES: Final[frozenset[str]] = frozenset(spec.tool_name for spec 
 APPROVAL_GATED_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     spec.tool_name for spec in APPROVAL_GATED_TOOLS
 )
+# Every tool the MCP server must expose, and nothing else.
+ALL_TOOL_NAMES: Final[frozenset[str]] = frozenset(TOOL_REGISTRY)
 
 
 def is_allowed(tool_name: str) -> bool:

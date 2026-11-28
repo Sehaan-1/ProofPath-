@@ -17,7 +17,13 @@ from proofpath.db.models import (
     VerdictType,
 )
 from proofpath.graph.checkpointer import _STATE_TYPES, postgres_checkpointer, thread_config
-from proofpath.graph.state import PolicyViolation, initial_state
+from proofpath.graph.state import (
+    ApprovalDecision,
+    ApprovalDraftSummary,
+    ApprovalRequest,
+    PolicyViolation,
+    initial_state,
+)
 from proofpath.policy.ledger_validator import DowngradeReason
 from proofpath.schemas.actions import (
     ActionDraftRecord,
@@ -111,6 +117,30 @@ def test_state_types_round_trip_with_strict_serializer() -> None:
     assert isinstance(result["policy_violations"][0], PolicyViolation)
     assert result["policy_violations"][1].downgrade_reason == DowngradeReason.EMPTY_CITATIONS
     assert isinstance(result["draft_actions"][0].payload, TrackerUpsertPayload)
+
+
+def test_approval_state_types_round_trip_with_strict_serializer() -> None:
+    run, draft = uuid.uuid4(), uuid.uuid4()
+    request = ApprovalRequest(
+        analysis_run_id=run,
+        drafts=[
+            ApprovalDraftSummary(
+                draft_id=draft,
+                action_type=ActionType.TRACKER_UPSERT,
+                summary="Update application tracker stage to 'preparing'",
+            )
+        ],
+    )
+    state = initial_state(uuid.uuid4(), settings=Settings(_env_file=None))
+    state["approval_request"] = request
+    state["approval_decision"] = ApprovalDecision(decision="approved", draft_id=draft)
+
+    serde = JsonPlusSerializer(allowed_msgpack_modules=_STATE_TYPES)
+    result = serde.loads_typed(serde.dumps_typed(state))
+    assert result == state
+    assert isinstance(result["approval_request"], ApprovalRequest)
+    assert result["approval_request"].draft_ids == {draft}
+    assert result["approval_decision"] == ApprovalDecision(decision="approved", draft_id=draft)
 
 
 def test_thread_config_rejects_blank_without_rewriting_id() -> None:

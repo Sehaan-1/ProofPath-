@@ -1,4 +1,4 @@
-"""Local ProofPath MCP server exposing allowlisted read-only Evidence & Opportunity tools.
+"""Local ProofPath MCP server exposing allowlisted Evidence, Opportunity, and approval tools.
 
 Slice 1.7:
 - Sub-part 1.7.1a: Typed `MCPServer("proofpath")` (`FastMCP` in MCP SDK v1, renamed
@@ -6,6 +6,13 @@ Slice 1.7:
 - Sub-part 1.7.2a: Read-only tools `search_evidence`, `get_opportunity`,
   `get_application_status`, and `get_action_draft` backed directly by Slice 1.1
   repositories and Slice 1.3 hybrid search.
+
+Slice 2.1.4 — approval-gated write tools:
+- Sub-part 2.1.4a: `create_action_draft` persists a `pending_approval` draft and
+  nothing else (no tracker/calendar/audit write). `approve_action` is the only tool
+  that executes side effects: it requires the draft to be `pending_approval` and the
+  explicit confirmation phrase, then delegates to `proofpath.approvals.decide_draft`
+  so the HTTP API and MCP share one decision/execution path.
 """
 
 from __future__ import annotations
@@ -25,29 +32,36 @@ from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
 from pydantic import ValidationError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 
 from proofpath.config import LogLevel, Settings, get_settings
-from proofpath.db.repositories.draft import DraftRepo
+from proofpath.db.repositories.draft import DraftRepo, draft_record
 from proofpath.db.repositories.opportunity import OpportunityRepo
 from proofpath.db.repositories.tracker import TrackerRepo
 from proofpath.db.session import DatabaseSessionManager
+from proofpath.mcp_server import action_tools
 from proofpath.policy.tool_allowlist import (
-    READ_ONLY_TOOL_NAMES,
+    ALL_TOOL_NAMES,
+    FORBIDDEN_TOOL_NAMES,
+    ToolAccess,
     ToolNotAllowedError,
     require_allowed,
 )
 from proofpath.retrieval.embeddings import EmbeddingClient, create_embedding_client
 from proofpath.retrieval.hybrid_search import DEFAULT_TOP_K, HybridSearcher
 from proofpath.schemas.actions import (
+    ActionDraftCreationResponse,
+    ActionDraftPayload,
     ActionDraftRecord,
     ApplicationStatusResponse,
-    parse_action_draft_payload,
+    DraftDecisionResponse,
 )
 from proofpath.schemas.evidence import EvidenceSearchResponse
 from proofpath.schemas.opportunity import OpportunityResponse, RequirementRecord
 from proofpath.schemas.tools import (
+    ApproveActionInput,
+    CreateActionDraftInput,
     GetActionDraftInput,
     GetApplicationStatusInput,
     GetOpportunityInput,
@@ -62,10 +76,15 @@ SERVER_NAME: Final[str] = "proofpath"
 SERVER_TITLE: Final[str] = "ProofPath"
 SERVER_VERSION: Final[str] = "0.1.0"
 SERVER_INSTRUCTIONS: Final[str] = (
-    "Read-only access to the personal ProofPath Evidence Ledger, target opportunities, "
-    "application tracker stages, and pending/historical action drafts. Every supported "
-    "claim must cite verified user-owned evidence chunks, and no mutating action is "
-    "executed by these read-only tools."
+    "Access to the personal ProofPath Evidence Ledger, target opportunities, application "
+    "tracker stages, and action drafts. Every supported claim must cite verified "
+    "user-owned evidence chunks. search_evidence/get_opportunity/get_application_status/"
+    "get_action_draft only read. create_action_draft only persists a pending_approval "
+    "draft and executes nothing. approve_action is the single tool that can execute a "
+    "side effect (tracker advance or calendar block, plus an immutable audit record): it "
+    "requires the draft to be pending_approval and the explicit confirmation phrase "
+    f"{action_tools.APPROVAL_CONFIRMATION_PHRASE!r}. Submitting applications, sending "
+    "email, and deleting tracker entries are not available at all."
 )
 
 MCPTransport: TypeAlias = Literal["stdio", "streamable-http"]
@@ -82,6 +101,15 @@ _LOG_LEVEL_MAP: Final[dict[LogLevel, MCPLogLevel]] = {
 
 _READ_ONLY_ANNOTATIONS: Final[ToolAnnotations] = ToolAnnotations(
     read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+# Approval-gated tools write only after an explicit human decision, and repeating a
+# call never applies a second side effect (so `idempotent_hint` stays True).
+_APPROVAL_GATED_ANNOTATIONS: Final[ToolAnnotations] = ToolAnnotations(
+    read_only_hint=False,
     destructive_hint=False,
     idempotent_hint=True,
     open_world_hint=False,
@@ -104,6 +132,14 @@ class _GetActionDraftArgs(GetActionDraftInput, ArgModelBase):
     """Strict MCP argument model (`extra='forbid'`) for `get_action_draft`."""
 
 
+class _CreateActionDraftArgs(CreateActionDraftInput, ArgModelBase):
+    """Strict MCP argument model (`extra='forbid'`) for `create_action_draft`."""
+
+
+class _ApproveActionArgs(ApproveActionInput, ArgModelBase):
+    """Strict MCP argument model (`extra='forbid'`) for `approve_action`."""
+
+
 class MCPServerRuntime:
     """Lifespan-scoped database and embedding resources for the ProofPath MCP server."""
 
@@ -113,9 +149,13 @@ class MCPServerRuntime:
         settings: Settings,
         open_session: SessionContextFactory,
         embedder: EmbeddingClient | None = None,
+        session_maker: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self.settings = settings
         self.open_session = open_session
+        # Transaction-scoped factory for the approval-gated tools; the read-only tools
+        # keep using `open_session` so they stay a single read per call.
+        self.session_maker = session_maker
         self._embedder = embedder
 
     def get_embedder(self) -> EmbeddingClient:
@@ -130,14 +170,15 @@ class MCPServerRuntime:
         return self._embedder
 
 
-def _build_read_only_tool(
+def _build_tool(
     fn: Callable[..., Any],
     *,
     arg_model: type[ArgModelBase],
+    access: ToolAccess,
 ) -> Tool:
-    """Register an allowlisted read-only tool with its strict `extra='forbid'` schema."""
+    """Register an allowlisted tool with its declared access level and strict schema."""
     spec = require_allowed(fn.__name__)
-    if not spec.is_read_only:
+    if spec.access is not access:
         raise ToolNotAllowedError(spec.tool_name)
     if arg_model.model_config.get("extra") != "forbid" or set(arg_model.model_fields) != set(
         spec.input_schema.model_fields
@@ -149,7 +190,7 @@ def _build_read_only_tool(
         fn,
         name=spec.tool_name,
         description=spec.description,
-        annotations=_READ_ONLY_ANNOTATIONS,
+        annotations=(_READ_ONLY_ANNOTATIONS if spec.is_read_only else _APPROVAL_GATED_ANNOTATIONS),
         structured_output=True,
     )
     tool.fn_metadata.arg_model = arg_model
@@ -239,30 +280,27 @@ async def _execute_get_action_draft(
     if draft is None:
         raise ToolError(f"Action draft {validated.draft_id} not found.")
     try:
-        payload = parse_action_draft_payload(draft.payload_json)
+        return draft_record(draft)
     except ValidationError as exc:
         raise ToolError(
             f"Stored payload for action draft {validated.draft_id} is invalid."
         ) from exc
-    return ActionDraftRecord(
-        id=draft.id,
-        analysis_run_id=draft.analysis_run_id,
-        action_type=draft.action_type,
-        status=draft.status,
-        payload=payload,
-        idempotency_key=draft.idempotency_key,
-        approved_at=draft.approved_at,
-        executed_at=draft.executed_at,
-    )
 
 
 def create_mcp_server(
     *,
     settings: Settings | None = None,
     session_factory: SessionContextFactory | None = None,
+    session_maker: async_sessionmaker[AsyncSession] | None = None,
     embedder: EmbeddingClient | None = None,
 ) -> MCPServer[MCPServerRuntime]:
-    """Create a typed `MCPServer("proofpath")` instance with Slice 1.7 read-only tools."""
+    """Create a typed `MCPServer("proofpath")` instance with the allowlisted tool set.
+
+    `session_factory` serves the read-only tools (one session per call). The
+    approval-gated tools additionally need `session_maker`, an
+    `async_sessionmaker`, because a decision spans several transactions and runs the
+    approved-only executor; it is derived from the database URL when omitted.
+    """
 
     @asynccontextmanager
     async def _lifespan(_server: MCPServer[MCPServerRuntime]) -> AsyncIterator[MCPServerRuntime]:
@@ -272,6 +310,7 @@ def create_mcp_server(
                 settings=active_settings,
                 open_session=session_factory,
                 embedder=embedder,
+                session_maker=session_maker,
             )
             return
         db_manager = DatabaseSessionManager(active_settings.asyncpg_database_url)
@@ -280,6 +319,7 @@ def create_mcp_server(
                 settings=active_settings,
                 open_session=db_manager.session,
                 embedder=embedder,
+                session_maker=db_manager.session_factory,
             )
         finally:
             await db_manager.close()
@@ -300,6 +340,7 @@ def create_mcp_server(
                 settings=active_settings,
                 open_session=session_factory,
                 embedder=embedder,
+                session_maker=session_maker,
             )
             return
         db_manager = DatabaseSessionManager(active_settings.asyncpg_database_url)
@@ -308,6 +349,7 @@ def create_mcp_server(
                 settings=active_settings,
                 open_session=db_manager.session,
                 embedder=embedder,
+                session_maker=db_manager.session_factory,
             )
         finally:
             await db_manager.close()
@@ -352,18 +394,59 @@ def create_mcp_server(
         async with _active_runtime(ctx) as runtime, runtime.open_session() as session:
             return await _execute_get_action_draft(session, draft_id=draft_id)
 
+    async def create_action_draft(
+        analysis_run_id: uuid.UUID,
+        payload: ActionDraftPayload,
+        idempotency_key: str,
+        ctx: Context[MCPServerRuntime, Any] | None = None,
+    ) -> ActionDraftCreationResponse:
+        """Persist a pending_approval action draft; never executes side effects."""
+        async with _active_runtime(ctx) as runtime, runtime.open_session() as session:
+            return await action_tools.create_action_draft(
+                session,
+                analysis_run_id=analysis_run_id,
+                payload=payload,
+                idempotency_key=idempotency_key,
+            )
+
+    async def approve_action(
+        draft_id: uuid.UUID,
+        confirmation_phrase: str,
+        ctx: Context[MCPServerRuntime, Any] | None = None,
+    ) -> DraftDecisionResponse:
+        """Approve one pending action draft and execute its side effect exactly once."""
+        async with _active_runtime(ctx) as runtime:
+            return await action_tools.approve_action(
+                draft_id=draft_id,
+                confirmation_phrase=confirmation_phrase,
+                session_maker=runtime.session_maker,
+                settings=runtime.settings,
+            )
+
     tools = [
-        _build_read_only_tool(search_evidence, arg_model=_SearchEvidenceArgs),
-        _build_read_only_tool(get_opportunity, arg_model=_GetOpportunityArgs),
-        _build_read_only_tool(get_application_status, arg_model=_GetApplicationStatusArgs),
-        _build_read_only_tool(get_action_draft, arg_model=_GetActionDraftArgs),
+        _build_tool(search_evidence, arg_model=_SearchEvidenceArgs, access=ToolAccess.READ_ONLY),
+        _build_tool(get_opportunity, arg_model=_GetOpportunityArgs, access=ToolAccess.READ_ONLY),
+        _build_tool(
+            get_application_status,
+            arg_model=_GetApplicationStatusArgs,
+            access=ToolAccess.READ_ONLY,
+        ),
+        _build_tool(get_action_draft, arg_model=_GetActionDraftArgs, access=ToolAccess.READ_ONLY),
+        _build_tool(
+            create_action_draft,
+            arg_model=_CreateActionDraftArgs,
+            access=ToolAccess.APPROVAL_GATED,
+        ),
+        _build_tool(approve_action, arg_model=_ApproveActionArgs, access=ToolAccess.APPROVAL_GATED),
     ]
     registered_names = frozenset(tool.name for tool in tools)
-    if registered_names != READ_ONLY_TOOL_NAMES:
+    if registered_names != ALL_TOOL_NAMES:
         raise RuntimeError(
-            f"Expected read-only tool set {sorted(READ_ONLY_TOOL_NAMES)}, "
+            f"Expected allowlisted tool set {sorted(ALL_TOOL_NAMES)}, "
             f"got {sorted(registered_names)}."
         )
+    if registered_names & FORBIDDEN_TOOL_NAMES:  # pragma: no cover - registry guarantees it
+        raise RuntimeError("A forbidden tool name was registered on the ProofPath MCP server.")
 
     active_log_level: MCPLogLevel = (
         _LOG_LEVEL_MAP[settings.log_level] if settings is not None else "INFO"

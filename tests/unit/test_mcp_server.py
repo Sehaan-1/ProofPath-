@@ -42,6 +42,8 @@ from proofpath.mcp_server import (
     run_mcp_server,
 )
 from proofpath.policy.tool_allowlist import (
+    ALL_TOOL_NAMES,
+    APPROVAL_CONFIRMATION_PHRASE,
     APPROVAL_GATED_TOOL_NAMES,
     FORBIDDEN_TOOL_NAMES,
     READ_ONLY_TOOL_NAMES,
@@ -97,7 +99,7 @@ def test_application_status_response_validates_tracked_invariants() -> None:
 
 
 @pytest.mark.parametrize("connect_mode", ["auto", "legacy"])
-async def test_list_tools_matches_read_only_allowlist_and_strict_json_schemas(
+async def test_list_tools_matches_allowlist_and_strict_json_schemas(
     connect_mode: str,
 ) -> None:
     server = create_mcp_server(
@@ -109,9 +111,10 @@ async def test_list_tools_matches_read_only_allowlist_and_strict_json_schemas(
         listed = await client.list_tools()
 
     by_name = {tool.name: tool for tool in listed.tools}
-    assert set(by_name) == set(READ_ONLY_TOOL_NAMES)
+    # Sub-slice 2.1.4 registers the two approval-gated tools alongside the readers.
+    assert set(by_name) == set(ALL_TOOL_NAMES)
+    assert set(by_name) == set(READ_ONLY_TOOL_NAMES) | set(APPROVAL_GATED_TOOL_NAMES)
     assert set(by_name).isdisjoint(FORBIDDEN_TOOL_NAMES)
-    assert set(by_name).isdisjoint(APPROVAL_GATED_TOOL_NAMES)
 
     for name, tool in by_name.items():
         jsonschema.Draft202012Validator.check_schema(tool.input_schema)
@@ -121,10 +124,13 @@ async def test_list_tools_matches_read_only_allowlist_and_strict_json_schemas(
         jsonschema.Draft202012Validator.check_schema(tool.output_schema)
         assert tool.output_schema.get("type") == "object"
         assert tool.annotations is not None
-        assert tool.annotations.read_only_hint is True
+        assert tool.annotations.read_only_hint is (name in READ_ONLY_TOOL_NAMES)
         assert tool.annotations.destructive_hint is False
         assert tool.annotations.idempotent_hint is True
         assert tool.annotations.open_world_hint is False
+
+    # Only `approve_action` documents a confirmation requirement.
+    assert APPROVAL_CONFIRMATION_PHRASE in by_name["approve_action"].description
 
 
 async def test_mcp_tools_reject_hallucinated_and_out_of_bounds_arguments() -> None:
@@ -470,7 +476,7 @@ async def test_streamable_http_transport_serves_tools_over_asgi_and_loopback_tcp
         transport = streamable_http_client("http://127.0.0.1:8000/mcp", http_client=http_client)
         async with Client(transport) as client:
             tools = await client.list_tools()
-            assert {t.name for t in tools.tools} == set(READ_ONLY_TOOL_NAMES)
+            assert {t.name for t in tools.tools} == set(ALL_TOOL_NAMES)
             res = await client.call_tool("get_application_status", {"opportunity_id": str(opp_id)})
             assert res.is_error is False
             assert res.structured_content == {
@@ -508,7 +514,7 @@ async def test_streamable_http_transport_serves_tools_over_asgi_and_loopback_tcp
         await asyncio.wait_for(ready.wait(), timeout=5.0)
         async with Client(f"http://127.0.0.1:{port}/mcp") as client:
             listed = await client.list_tools()
-            assert {t.name for t in listed.tools} == set(READ_ONLY_TOOL_NAMES)
+            assert {t.name for t in listed.tools} == set(ALL_TOOL_NAMES)
             status_res = await client.call_tool(
                 "get_application_status", {"opportunity_id": str(opp_id)}
             )

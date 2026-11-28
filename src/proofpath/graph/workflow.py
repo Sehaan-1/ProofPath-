@@ -4,6 +4,9 @@ Compile inside ``postgres_checkpointer``'s context, and keep that context open
 while using the graph. Invoke with the same thread_config on resume and
 ``durability='sync'``. Each database node commits before returning; parsing and
 approval-draft creation are replay-safe if a checkpoint write then fails.
+``create_action_drafts`` is followed by ``approval_gate``, which pauses the run
+with LangGraph's native ``interrupt()``; resume the *same* thread with
+``BoundedWorkflow.aresume({"decision": ..., "draft_id": ...})``.
 Node failures route to a terminal fallback with a sanitized error and best-effort
 audit record. Checkpoint and process-level failures cannot be handled by a node.
 """
@@ -20,6 +23,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proofpath.config import Settings
@@ -27,6 +31,7 @@ from proofpath.db.models import AuditActor
 from proofpath.db.repositories.analysis import AnalysisRepo
 from proofpath.db.repositories.audit import AuditRepo
 from proofpath.db.repositories.evidence import EvidenceRepo
+from proofpath.graph.approval import approval_gate_node, pending_approval_request
 from proofpath.graph.checkpointer import thread_config
 from proofpath.graph.nodes import (
     EvidenceComparator,
@@ -41,7 +46,7 @@ from proofpath.graph.nodes import (
     recommend_contribution_sprint_node,
     retrieve_evidence_node,
 )
-from proofpath.graph.state import GraphError, ProofPathState
+from proofpath.graph.state import ApprovalRequest, GraphError, ProofPathState
 from proofpath.ingestion.analyse_role import RoleParserBackend, is_retryable_role_parse_error
 from proofpath.policy.ledger_validator import LedgerValidator
 from proofpath.retrieval.embeddings import EmbeddingClient
@@ -89,6 +94,23 @@ class BoundedWorkflow:
         """Execute with a fixed upper bound; caller overrides cannot relax it."""
         kwargs["durability"] = "sync"
         return await self._graph.ainvoke(input, self._config(config), **kwargs)
+
+    async def aresume(
+        self,
+        value: object,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Resume a paused interrupt on this thread with synchronous durability.
+
+        ``value`` is the interrupt's resume value; the approval gate expects
+        ``{"decision": "approved" | "rejected", "draft_id": "<uuid>"}``.
+        """
+        return await self.ainvoke(Command(resume=value), config, **kwargs)
+
+    async def apending_approval(self) -> ApprovalRequest | None:
+        """Return the approval request when the thread is paused at the gate."""
+        return pending_approval_request(await self.aget_state())
 
     async def astream(
         self,
@@ -195,6 +217,10 @@ def build_workflow(
                 calendar_end=calendar_end,
             )
 
+    async def approval(state: ProofPathState, config: RunnableConfig) -> dict[str, object]:
+        guard(state, config)
+        return await approval_gate_node(state, analysis_run_id=analysis_run_id)
+
     def wrap_node(name: str, node: Node) -> Node:
         async def guarded(state: ProofPathState, config: RunnableConfig) -> dict[str, object]:
             # Thread mismatch is an authorization/configuration failure, not a graph error.
@@ -267,6 +293,9 @@ def build_workflow(
     def route_planner(state: ProofPathState) -> str:
         return "fallback_error" if state.get("pending_error") else planner_route(state)
 
+    def route_approval(state: ProofPathState) -> str:
+        return "fallback_error" if state.get("pending_error") else END
+
     def route_policy(state: ProofPathState) -> str:
         if state.get("pending_error"):
             return "fallback_error"
@@ -281,6 +310,7 @@ def build_workflow(
         ("policy", policy),
         ("sprint", sprint),
         ("drafts", drafts),
+        ("approval_gate", approval),
     ):
         builder.add_node(name, wrap_node(name, node))  # type: ignore[call-overload]
     builder.add_node("fallback_error", fallback_error_node)
@@ -299,7 +329,10 @@ def build_workflow(
         "policy", route_policy, ["compare_evidence", "sprint", "fallback_error"]
     )
     builder.add_conditional_edges("sprint", route("drafts"), ["drafts", "fallback_error"])
-    builder.add_conditional_edges("drafts", route(END), [END, "fallback_error"])
+    builder.add_conditional_edges(
+        "drafts", route("approval_gate"), ["approval_gate", "fallback_error"]
+    )
+    builder.add_conditional_edges("approval_gate", route_approval, [END, "fallback_error"])
     builder.add_edge("fallback_error", END)
     return BoundedWorkflow(builder.compile(checkpointer=checkpointer), thread_id, step_budget)
 

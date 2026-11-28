@@ -102,6 +102,24 @@ class Settings(BaseSettings):
         description="Optional GitHub PAT for higher-rate-limit REST API evidence ingestion.",
     )
 
+    # Approved-only side effects (Sub-part 2.1.3b)
+    enable_google_calendar: bool = Field(
+        default=False,
+        description=(
+            "Explicit opt-in for live Google Calendar writes. Defaults to False: an "
+            "approved calendar_block draft then only writes the local calendar task and "
+            "the downloadable .ics invite, and ProofPath makes no network call."
+        ),
+    )
+    google_calendar_id: SecretStr | None = Field(
+        default=None,
+        description="Target Google Calendar id (for example 'primary') when opted in.",
+    )
+    google_calendar_access_token: SecretStr | None = Field(
+        default=None,
+        description="OAuth access token used for the opt-in Google Calendar import call.",
+    )
+
     # Safety & observability
     observability_backend: ObservabilityBackend = Field(
         default=ObservabilityBackend.NONE,
@@ -118,7 +136,13 @@ class Settings(BaseSettings):
         description="Mask personal phone numbers/addresses before external LLM calls.",
     )
 
-    @field_validator("llm_api_key", "github_token", mode="before")
+    @field_validator(
+        "llm_api_key",
+        "github_token",
+        "google_calendar_id",
+        "google_calendar_access_token",
+        mode="before",
+    )
     @classmethod
     def _empty_secret_to_none(cls, value: Any) -> Any:
         """Treat blank environment values (e.g. `GITHUB_TOKEN=`) as unset."""
@@ -149,6 +173,17 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "LLM_API_KEY must be set when APP_ENV=production for hosted LLM providers."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_google_calendar_opt_in(self) -> Settings:
+        if self.enable_google_calendar and (
+            self.google_calendar_id is None or self.google_calendar_access_token is None
+        ):
+            raise ValueError(
+                "ENABLE_GOOGLE_CALENDAR=true requires GOOGLE_CALENDAR_ID and "
+                "GOOGLE_CALENDAR_ACCESS_TOKEN."
             )
         return self
 
