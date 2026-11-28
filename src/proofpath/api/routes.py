@@ -11,11 +11,12 @@ from pathlib import PurePath
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse
 from pypdf import PdfReader
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from proofpath.config import LLMProvider
-from proofpath.db.models import EvidenceSourceType
+from proofpath.db.models import EvidenceSourceType, JobStatus
 from proofpath.db.repositories.evidence import EvidenceRepo
 from proofpath.db.repositories.opportunity import OpportunityRepo
 from proofpath.db.repositories.tracker import TrackerRepo
@@ -34,6 +35,7 @@ from proofpath.ingestion.job_fetcher import EmptyJobDescriptionError, JobPageFet
 from proofpath.ingestion.markdown_ingester import IngestStatus, persist_parsed_document
 from proofpath.ingestion.resume_parser import ParsedDocument, hash_bytes, parse_resume_text
 from proofpath.ingestion.secure_job_fetcher import SecureJobPageFetcher
+from proofpath.jobs import GITHUB_INGEST_TASK, GithubIngestJobPayload, enqueue_job
 from proofpath.retrieval.embeddings import create_embedding_client
 from proofpath.retrieval.hybrid_search import HybridSearcher
 from proofpath.schemas.actions import TrackerRecord
@@ -43,11 +45,13 @@ from proofpath.schemas.evidence import (
     IngestResponse,
     IngestTextRequest,
 )
+from proofpath.schemas.jobs import JobAcceptedResponse
 from proofpath.schemas.opportunity import (
     OpportunityCreateRequest,
     OpportunityResponse,
     RequirementRecord,
 )
+from proofpath.workers.queue import JobQueue
 
 router = APIRouter(prefix="/api/v1")
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
@@ -177,10 +181,8 @@ async def ingest_file(
         await file.close()
 
 
-@router.post("/evidence/ingest/github", response_model=IngestResponse, status_code=201)
-async def ingest_github(
-    payload: IngestGitHubRequest, request: Request, session: Session
-) -> IngestResponse:
+def _validate_github_ref(payload: IngestGitHubRequest) -> GitHubRepoRef:
+    """Parse and validate a GitHub repository reference, raising 422 on bad input."""
     try:
         candidate = GitHubRepoRef.from_request(payload)
         if not all(
@@ -188,9 +190,51 @@ async def ingest_github(
             for part in (candidate.owner, candidate.name)
         ):
             raise ValueError("Invalid GitHub owner or repository")
-        ref = candidate
+        return candidate
     except ValueError as exc:
         raise HTTPException(422, "Invalid GitHub repository reference.") from exc
+
+
+def _job_queue(request: Request) -> JobQueue:
+    """Return the configured Redis job queue, or 503 when not wired."""
+    queue: JobQueue | None = getattr(request.app.state, "job_queue", None)
+    if queue is None:
+        raise HTTPException(503, "Job queue is not configured.")
+    return queue
+
+
+@router.post(
+    "/evidence/ingest/github",
+    response_model=IngestResponse,
+    status_code=201,
+    responses={202: {"description": "Job enqueued", "model": JobAcceptedResponse}},
+)
+async def ingest_github(
+    payload: IngestGitHubRequest,
+    request: Request,
+    session: Session,
+    async_run: Annotated[bool, Query(alias="async")] = False,
+) -> IngestResponse | JSONResponse:
+    """Ingest a GitHub repository synchronously, or enqueue it when `?async=true`."""
+    ref = _validate_github_ref(payload)
+    if async_run:
+        try:
+            job = await enqueue_job(
+                queue=_job_queue(request),
+                session_factory=request.app.state.session_factory,
+                job_type=GITHUB_INGEST_TASK,
+                payload_model=GithubIngestJobPayload(owner=ref.owner, name=ref.name),
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(503, "Job queue is unavailable.") from exc
+        return JSONResponse(
+            status_code=202,
+            content=JobAcceptedResponse(
+                job_id=job.id, job_type=GITHUB_INGEST_TASK, status=JobStatus.QUEUED
+            ).model_dump(mode="json"),
+        )
     settings = request.app.state.settings
     token = settings.github_token.get_secret_value() if settings.github_token else None
     try:

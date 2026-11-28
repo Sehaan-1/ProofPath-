@@ -1,4 +1,4 @@
-"""Synchronous analysis lifecycle, reporting, and failure semantics."""
+"""Synchronous and async analysis lifecycle, reporting, and failure semantics."""
 
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -10,10 +10,12 @@ import pytest
 from fastapi.testclient import TestClient
 from langgraph.types import Interrupt
 
+from proofpath import jobs
 from proofpath.api import analysis_routes, routes
 from proofpath.config import Settings
 from proofpath.db.models import (
     AnalysisRunStatus,
+    JobStatus,
     RequirementCategory,
     RequirementPriority,
     VerdictType,
@@ -106,6 +108,9 @@ def app_services(monkeypatch):
             ]
 
     monkeypatch.setattr(analysis_routes, "AnalysisRepo", Repo)
+    # `execute_analysis_graph` (in `proofpath.jobs`) resolves AnalysisRepo and
+    # build_workflow from the jobs module, so patch there too.
+    monkeypatch.setattr(jobs, "AnalysisRepo", Repo)
 
     class FakeDependencies:
         parser = embedder = comparator = sprint_planner = object()
@@ -140,7 +145,13 @@ def app_services(monkeypatch):
             ],
         }
     )
-    monkeypatch.setattr(analysis_routes, "build_workflow", lambda **_kwargs: graph)
+    monkeypatch.setattr(jobs, "build_workflow", lambda **_kwargs: graph)
+
+    # Async path: a job queue on app state and a mocked enqueue_job.
+    app.state.job_queue = MagicMock()
+    fake_job = SimpleNamespace(id=uuid4(), job_type="analysis_run", status=JobStatus.QUEUED)
+    enqueue_mock = AsyncMock(return_value=fake_job)
+    monkeypatch.setattr(analysis_routes, "enqueue_job", enqueue_mock)
 
     async def provide_session():
         yield session
@@ -202,14 +213,32 @@ def test_graph_failure_is_failed_and_never_persists_unverified_verdicts(app_serv
     assert next(iter(runs.values())).status == AnalysisRunStatus.FAILED
 
 
-def test_async_and_invalid_calendar_rejected_before_creation(app_services):
+def test_async_analysis_enqueues_job_and_returns_202(app_services):
     client, _, runs, opp_id, _, _ = app_services
-    assert (
-        client.post(
-            "/api/v1/analyses/run", json={"opportunity_id": str(opp_id), "async_run": True}
-        ).status_code
-        == 501
+    response = client.post(
+        "/api/v1/analyses/run", json={"opportunity_id": str(opp_id), "async_run": True}
     )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_type"] == "analysis_run"
+    assert body["status"] == "queued"
+    assert "job_id" in body
+    # The async path creates a background job, not an analysis_run row.
+    assert not runs
+
+
+def test_query_async_alias_also_enqueues(app_services):
+    client, _, _, opp_id, _, _ = app_services
+    response = client.post(
+        "/api/v1/analyses/run?async=true",
+        json={"opportunity_id": str(opp_id)},
+    )
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+
+
+def test_invalid_calendar_rejected_before_creation(app_services):
+    client, _, runs, opp_id, _, _ = app_services
     assert (
         client.post(
             "/api/v1/analyses/run",

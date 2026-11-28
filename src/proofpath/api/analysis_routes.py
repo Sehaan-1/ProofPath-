@@ -1,37 +1,50 @@
-"""Synchronous analysis execution and checkpoint-backed report endpoints."""
+"""Synchronous and async analysis execution and checkpoint-backed report endpoints."""
 
 from __future__ import annotations
 
-import asyncio
-import time
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import AnyHttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from proofpath.api.routes import Session
+from proofpath.api.routes import Session, _job_queue
 from proofpath.config import LLMProvider
-from proofpath.db.models import AnalysisRunStatus
-from proofpath.db.repositories.analysis import AnalysisRepo, ClaimVerdictInput
+from proofpath.db.models import AnalysisRunStatus, JobStatus
+from proofpath.db.repositories.analysis import AnalysisRepo
 from proofpath.db.repositories.draft import draft_record
 from proofpath.db.repositories.opportunity import OpportunityRepo
-from proofpath.graph.approval import approval_request_from_interrupts
 from proofpath.graph.checkpointer import thread_config
 from proofpath.graph.dependencies import GraphDependenciesError, create_graph_dependencies
-from proofpath.graph.state import initial_state
-from proofpath.graph.workflow import build_workflow
+from proofpath.jobs import (
+    ANALYSIS_RUN_TASK,
+    AnalysisRunJobPayload,
+    enqueue_job,
+    execute_analysis_graph,
+)
 from proofpath.schemas.analysis import AnalysisReport, AnalysisRunCreateRequest, ClaimVerdictSchema
+from proofpath.schemas.jobs import JobAcceptedResponse
 from proofpath.schemas.opportunity import ParsedRole, RequirementItem, RequirementRecord
 
 router = APIRouter(prefix="/api/v1", tags=["analysis"])
 
 
-@router.post("/analyses/run", response_model=AnalysisReport, status_code=201)
-async def run_analysis(payload: AnalysisRunCreateRequest, request: Request) -> AnalysisReport:
-    """Run synchronously. Async queue execution is reserved for Slice 2.2."""
-    if payload.async_run:
-        raise HTTPException(501, "Queued analyses are not implemented.")
+@router.post(
+    "/analyses/run",
+    response_model=AnalysisReport,
+    status_code=201,
+    responses={202: {"description": "Analysis job enqueued", "model": JobAcceptedResponse}},
+)
+async def run_analysis(
+    payload: AnalysisRunCreateRequest,
+    request: Request,
+    async_run: Annotated[bool, Query(alias="async")] = False,
+) -> AnalysisReport | JSONResponse:
+    """Run synchronously, or enqueue a background job when `?async=true` (or body flag)."""
+    if payload.async_run or async_run:
+        return await _enqueue_analysis(payload, request)
     settings = request.app.state.settings
     if settings.llm_provider is not LLMProvider.OPENAI:
         raise HTTPException(501, "Analysis currently requires the OpenAI model provider.")
@@ -48,75 +61,58 @@ async def run_analysis(payload: AnalysisRunCreateRequest, request: Request) -> A
         await AnalysisRepo(session).create_run(
             opportunity_id=payload.opportunity_id, thread_id=thread_id, run_id=run_id
         )
-    started = time.monotonic()
     try:
-        graph = build_workflow(
-            checkpointer=request.app.state.checkpointer,
-            session_factory=factory,
+        await execute_analysis_graph(
             settings=settings,
-            analysis_run_id=run_id,
+            session_factory=factory,
+            checkpointer=request.app.state.checkpointer,
+            dependencies=dependencies,
+            opportunity_id=payload.opportunity_id,
+            run_id=run_id,
             thread_id=thread_id,
-            parser=dependencies.parser,
-            embedder=dependencies.embedder,
-            comparator=dependencies.comparator,
-            sprint_planner=dependencies.sprint_planner,
             calendar_start=payload.calendar_start,
             calendar_end=payload.calendar_end,
         )
-        state = await graph.ainvoke(
-            initial_state(payload.opportunity_id, settings=settings), thread_config(thread_id)
-        )
-        errors = state.get("errors", [])
-        verified = state.get("policy_verified", False)
-        interrupts = state.get("__interrupt__") or ()
-        paused_for_approval = approval_request_from_interrupts(interrupts) is not None and bool(
-            state.get("draft_actions")
-        )
-        if errors or not verified or (interrupts and not paused_for_approval):
-            # A pause anywhere other than the approval gate is not approvable.
-            status = AnalysisRunStatus.FAILED
-        elif paused_for_approval:
-            status = AnalysisRunStatus.AWAITING_APPROVAL
-        else:
-            status = AnalysisRunStatus.COMPLETED
-        async with factory.begin() as session:
-            repo = AnalysisRepo(session)
-            if verified:
-                await repo.upsert_verdicts(
-                    run_id,
-                    [
-                        ClaimVerdictInput(
-                            requirement_id=v.requirement_id,
-                            verdict=v.verdict,
-                            claim_summary=v.claim_summary,
-                            cited_chunk_ids=v.cited_chunk_ids,
-                            policy_downgraded=v.policy_downgraded,
-                            gap_notes=v.gap_notes,
-                        )
-                        for v in state.get("verdicts", [])
-                    ],
-                )
-            await repo.update_run_metrics(
-                run_id, status=status, latency_ms=int((time.monotonic() - started) * 1000)
-            )
-    except asyncio.CancelledError:
-        async with factory.begin() as session:
-            await AnalysisRepo(session).update_run_metrics(
-                run_id,
-                status=AnalysisRunStatus.FAILED,
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
-        raise
     except Exception as exc:
-        async with factory.begin() as session:
-            await AnalysisRepo(session).update_run_metrics(
-                run_id,
-                status=AnalysisRunStatus.FAILED,
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
         raise HTTPException(503, "Analysis could not be completed.") from exc
     async with factory() as session:
         return await _get_report(run_id, request, session)
+
+
+async def _enqueue_analysis(payload: AnalysisRunCreateRequest, request: Request) -> JSONResponse:
+    """Validate inputs and enqueue an async analysis job; return 202 + job_id."""
+    settings = request.app.state.settings
+    if settings.llm_provider is not LLMProvider.OPENAI:
+        raise HTTPException(501, "Analysis currently requires the OpenAI model provider.")
+    try:
+        create_graph_dependencies(settings)
+    except GraphDependenciesError as exc:
+        raise HTTPException(503, "Analysis model is not configured.") from exc
+    factory = request.app.state.session_factory
+    async with factory.begin() as session:
+        if await OpportunityRepo(session).get_by_id(payload.opportunity_id) is None:
+            raise HTTPException(404, "Opportunity not found.")
+    try:
+        job = await enqueue_job(
+            queue=_job_queue(request),
+            session_factory=factory,
+            job_type=ANALYSIS_RUN_TASK,
+            payload_model=AnalysisRunJobPayload(
+                opportunity_id=payload.opportunity_id,
+                calendar_start=payload.calendar_start,
+                calendar_end=payload.calendar_end,
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, "Job queue is unavailable.") from exc
+    return JSONResponse(
+        status_code=202,
+        content=JobAcceptedResponse(
+            job_id=job.id, job_type=ANALYSIS_RUN_TASK, status=JobStatus.QUEUED
+        ).model_dump(mode="json"),
+    )
 
 
 async def _get_report(run_id: uuid.UUID, request: Request, session: AsyncSession) -> AnalysisReport:

@@ -117,11 +117,41 @@ permanent error (`transient=False`) or an unknown task type fails straight to
 fully unit-tested without a database.
 
 Exponential backoff timing (2s → 8s → 30s) and a dead-letter replay CLI arrive in
-Sub-slice 2.2.3; the real `github_ingest` and `analysis_run` handlers (and the
-`POST …?async=true → 202 + job_id` endpoints) arrive in Sub-slice 2.2.2. Today
-the registry ships two built-in smoke-test tasks — `noop` (succeeds immediately)
-and `echo` (returns its payload) — enough to exercise the full
-queue → worker → ledger loop end to end.
+Sub-slice 2.2.3. The registry ships two built-in smoke-test tasks — `noop`
+(succeeds immediately) and `echo` (returns its payload) — plus the real
+offloaded-work handlers below.
+
+### Async Workflows & Job Status (Slice 2.2.2)
+
+Long-running ingestion and full analyses are offloaded to the worker so the API
+responds immediately with `202 Accepted` + a `job_id`. The client then polls
+`GET /api/v1/jobs/{job_id}` until the job reaches a terminal state
+(`succeeded` / `dead_letter`).
+
+- **Async GitHub ingestion & batch embedding** —
+  `POST /api/v1/evidence/ingest/github?async=true` validates the repo reference,
+  enqueues a `github_ingest` job (ledger row + Redis message), and returns
+  `202` + `job_id`. The worker fetches the snapshot, persists the evidence
+  source, embeds the chunks, and records `{source_id, chunk_count, ...}` in the
+  job `result`. A GitHub 404/422 fails fast to `dead_letter`; a 429/5xx/network
+  error is retried up to `max_attempts`.
+- **Async full opportunity analysis** —
+  `POST /api/v1/analyses/run?async=true` (or body `{"async_run": true}`) validates
+  the opportunity and model wiring, enqueues an `analysis_run` job, and returns
+  `202` + `job_id`. The worker creates the `analysis_runs` row + checkpoint
+  thread, runs the same `execute_analysis_graph` routine as the synchronous path,
+  and records `{analysis_run_id, thread_id, status}` in the job `result` — so the
+  client can then `GET /api/v1/analyses/{analysis_run_id}` for the full report. A
+  graph that reaches a terminal `failed` state is treated as job success (the
+  outcome is recorded), avoiding duplicate runs on retry; only a missing
+  opportunity or unconfigured model fails fast to `dead_letter`.
+- **`GET /api/v1/jobs/{job_id}`** — trimmed, public status view of one
+  `background_jobs` row (`status`, `attempt`/`max_attempts`, `last_error`,
+  `result`, lifecycle timestamps). Omits the raw payload and Python traceback.
+
+The producer (`enqueue_job`) commits the ledger row *before* the Redis `XADD`, so
+a worker can never receive a message whose status row is uncommitted; if the
+append itself fails the row is moved to `dead_letter` and the API returns `503`.
 
 ## Local ProofPath MCP Server (Read-Only & Approval-Gated Tools)
 

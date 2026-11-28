@@ -22,10 +22,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from proofpath.api.analysis_routes import router as analysis_router
 from proofpath.api.calendar_routes import router as calendar_router
 from proofpath.api.draft_routes import router as draft_router
+from proofpath.api.jobs_routes import router as jobs_router
 from proofpath.api.routes import router
 from proofpath.config import Settings, get_settings
 from proofpath.db.session import create_db_engine, create_session_factory, verify_pgvector_extension
 from proofpath.graph.checkpointer import postgres_checkpointer
+from proofpath.workers.queue import JobQueue
 
 logger = logging.getLogger(__name__)
 _HEALTH_TIMEOUT_SECONDS = 5.0
@@ -68,6 +70,10 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         active_settings = settings if settings is not None else get_settings()
         engine = create_db_engine(settings=active_settings)
+        # Redis client is lazy: `from_url` does not connect until a command runs,
+        # so the API starts even when Redis is down; only the async enqueue paths
+        # (which need it) will surface a 503 when Redis is unreachable.
+        job_queue = JobQueue.from_url(str(active_settings.redis_url))
         try:
             session_factory = create_session_factory(engine)
             async with postgres_checkpointer(settings=active_settings) as saver:
@@ -75,9 +81,12 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 application.state.db_engine = engine
                 application.state.session_factory = session_factory
                 application.state.checkpointer = saver
+                application.state.job_queue = job_queue
                 try:
                     yield
                 finally:
+                    await job_queue.close()
+                    del application.state.job_queue
                     del application.state.checkpointer
                     del application.state.session_factory
                     del application.state.db_engine
@@ -152,6 +161,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     application.include_router(analysis_router)
     application.include_router(draft_router)
     application.include_router(calendar_router)
+    application.include_router(jobs_router)
     return application
 
 

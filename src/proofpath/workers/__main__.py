@@ -2,11 +2,15 @@
 
 Run with ``python -m proofpath.workers`` (the ``worker`` Docker Compose service
 does exactly this). It wires Redis (queue), PostgreSQL (job ledger), and the
-task registry, then runs the consume loop until SIGINT/SIGTERM.
+Postgres checkpointer (required for analysis runs), then registers the real
+async-work handlers from :mod:`proofpath.jobs` and runs the consume loop until
+SIGINT/SIGTERM.
 
-Sub-slice 2.2.1 registers the built-in ``noop`` / ``echo`` smoke-test tasks;
-Sub-slice 2.2.2 will register the real ``github_ingest`` and ``analysis_run``
-handlers here (or via a factory) without changing this bootstrap.
+GitHub ingestion handlers need only settings + a session factory; the analysis
+handler additionally needs a live ``AsyncPostgresSaver``. If the checkpointer
+cannot be opened, the worker still starts with the ``github_ingest`` and
+smoke-test tasks registered — an enqueued analysis job is then dead-lettered as
+an unknown task type rather than crashing the worker.
 """
 
 from __future__ import annotations
@@ -15,31 +19,39 @@ import asyncio
 import contextlib
 import logging
 import signal
+from typing import TYPE_CHECKING
 
-from proofpath.config import get_settings
+from proofpath.config import Settings, get_settings
 from proofpath.db.session import create_db_engine, create_session_factory
+from proofpath.graph.checkpointer import postgres_checkpointer
+from proofpath.jobs import create_task_registry
 from proofpath.workers.queue import JobQueue
-from proofpath.workers.tasks import default_registry
 from proofpath.workers.worker import SqlAlchemyJobStore, Worker
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = logging.getLogger(__name__)
 
 
-async def main() -> None:
-    """Bootstrap and run the ProofPath background worker until stopped."""
-    settings = get_settings()
-    logging.basicConfig(
-        level=settings.log_level.value,
-        format="%(asctime)s %(levelname)-5.5s [%(name)s] %(message)s",
+async def _run_worker(
+    *,
+    queue: JobQueue,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    checkpointer: AsyncPostgresSaver | None,
+) -> None:
+    registry = create_task_registry(
+        settings=settings,
+        session_factory=session_factory,
+        checkpointer=checkpointer,
     )
-
-    queue = JobQueue.from_url(str(settings.redis_url))
-    engine = create_db_engine(settings.asyncpg_database_url)
-    session_factory = create_session_factory(engine)
-    store = SqlAlchemyJobStore(session_factory)
-    registry = default_registry()
-    worker = Worker(queue=queue, store=store, registry=registry)
-
+    worker = Worker(
+        queue=queue,
+        store=SqlAlchemyJobStore(session_factory),
+        registry=registry,
+    )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -56,6 +68,44 @@ async def main() -> None:
     )
     try:
         await worker.run(stop_event=stop_event)
+    finally:
+        logger.info("ProofPath worker stopped.")
+
+
+async def main() -> None:
+    """Bootstrap and run the ProofPath background worker until stopped."""
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.value,
+        format="%(asctime)s %(levelname)-5.5s [%(name)s] %(message)s",
+    )
+
+    queue = JobQueue.from_url(str(settings.redis_url))
+    engine = create_db_engine(settings.asyncpg_database_url)
+    session_factory = create_session_factory(engine)
+    try:
+        # Open the checkpointer for the analysis handler. If it cannot be opened
+        # (DDL unavailable, connectivity), fall back to a registry without the
+        # analysis task so github_ingest / smoke-test jobs still process.
+        try:
+            async with postgres_checkpointer(settings=settings) as checkpointer:
+                await _run_worker(
+                    queue=queue,
+                    settings=settings,
+                    session_factory=session_factory,
+                    checkpointer=checkpointer,
+                )
+        except Exception:
+            logger.exception(
+                "Postgres checkpointer unavailable; starting worker without the "
+                "analysis_run task (those jobs will be dead-lettered)."
+            )
+            await _run_worker(
+                queue=queue,
+                settings=settings,
+                session_factory=session_factory,
+                checkpointer=None,
+            )
     finally:
         await engine.dispose()
         await queue.close()
