@@ -143,6 +143,11 @@ APPROVAL_GATED_TOOL_NAMES: Final[frozenset[str]] = frozenset(
 )
 # Every tool the MCP server must expose, and nothing else.
 ALL_TOOL_NAMES: Final[frozenset[str]] = frozenset(TOOL_REGISTRY)
+# The analysis itself may read and create pending drafts, never approve an action.
+# Explicit human decisions are handled outside the graph.
+ANALYSIS_TOOL_NAMES: Final[frozenset[str]] = (
+    READ_ONLY_TOOL_NAMES | {ToolName.CREATE_ACTION_DRAFT.value}
+) - FORBIDDEN_TOOL_NAMES
 
 
 def is_allowed(tool_name: str) -> bool:

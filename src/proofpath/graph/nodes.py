@@ -29,7 +29,10 @@ from proofpath.db.repositories.tracker import TrackerRepo
 from proofpath.graph.state import PolicyViolation, ProofPathState
 from proofpath.ingestion.analyse_role import RoleParserBackend
 from proofpath.ingestion.job_fetcher import build_parser_prompt
+from proofpath.policy.injection_guard import contains_jd_injection
 from proofpath.policy.ledger_validator import LedgerValidator
+from proofpath.policy.tool_allowlist import ToolName
+from proofpath.policy.tool_trace import call_analysis_tool
 from proofpath.schemas.actions import (
     ActionDraftRecord,
     CalendarBlockPayload,
@@ -78,8 +81,8 @@ async def retrieve_evidence_node(
         raise ValueError("top_k must be between 1 and 50")
     evidence: dict[str, list[EvidenceSnippet]] = {}
     for requirement in _requirements(state):
-        evidence[str(requirement.id)] = await searcher.search(
-            requirement.requirement_text, top_k=top_k
+        evidence[str(requirement.id)] = await call_analysis_tool(
+            ToolName.SEARCH_EVIDENCE, searcher.search, requirement.requirement_text, top_k=top_k
         )
     return {
         "retrieved_evidence": evidence,
@@ -248,18 +251,24 @@ async def planner_router(
         raise ValueError("opportunity_id must be a UUID")
     if step_budget < 1:
         raise ValueError("step_budget must be positive")
-    opportunity = await OpportunityRepo(session).get_by_id(opportunity_id)
+    opportunity = await call_analysis_tool(
+        ToolName.GET_OPPORTUNITY, OpportunityRepo(session).get_by_id, opportunity_id
+    )
     if opportunity is None:
         raise ValueError("Opportunity does not exist")
     if state.get("requirements"):
         _requirements(state)
-    tracker = await TrackerRepo(session).get_by_opportunity_id(opportunity_id)
+    tracker = await call_analysis_tool(
+        ToolName.GET_APPLICATION_STATUS, TrackerRepo(session).get_by_opportunity_id, opportunity_id
+    )
     retries = state.get("max_retries")
     if retries is None:
         retries = (settings or get_settings()).max_agent_retries
     if retries < 0 or retries > (settings or get_settings()).max_agent_retries:
         raise ValueError("max_retries exceeds the configured retry limit")
     return {
+        # Diagnose the source even when cached requirements bypass role parsing.
+        "injection_detected": contains_jd_injection(opportunity.raw_text),
         "tracker_stage": tracker.stage.value if tracker else None,
         "step_budget": step_budget,
         "step_count": state.get("step_count", 0) + 1,
@@ -375,7 +384,11 @@ async def create_action_drafts_node(
     run = result.scalar_one_or_none()
     if run is None or run.opportunity_id != state["opportunity_id"]:
         raise ValueError("Analysis run does not belong to opportunity")
-    tracker = await TrackerRepo(session).get_by_opportunity_id(state["opportunity_id"])
+    tracker = await call_analysis_tool(
+        ToolName.GET_APPLICATION_STATUS,
+        TrackerRepo(session).get_by_opportunity_id,
+        state["opportunity_id"],
+    )
     # Do not propose a backwards transition or discard existing notes.
     stage = tracker.stage if tracker else ApplicationStage.SAVED
     if stage is ApplicationStage.SAVED:
@@ -407,7 +420,9 @@ async def create_action_drafts_node(
     records: list[ActionDraftRecord] = []
     for payload in payloads:
         key = f"proofpath:{analysis_run_id}:{payload.action_type.value}"
-        row, _ = await repo.create_or_get_draft(
+        row, _ = await call_analysis_tool(
+            ToolName.CREATE_ACTION_DRAFT,
+            repo.create_or_get_draft,
             analysis_run_id=analysis_run_id,
             action_type=payload.action_type,
             payload_json=payload.model_dump(mode="json"),

@@ -9,18 +9,17 @@ The pause is consumed durably: the run is atomically claimed out of
 ``awaiting_approval`` before the resume is attempted, so two concurrent approvals
 cannot both resume (and therefore cannot both execute later side effects).
 
-Scope: this module records the human decision in graph state and finishes the run.
-Committing the decision onto ``action_drafts`` and the approval endpoints arrive in
-Sub-slice 2.1.2; approved-only side-effect executors (tracker upsert, `.ics`
-calendar blocks, audit entries) arrive in Sub-slice 2.1.3. Nothing here mutates
-``application_tracker``, calendars, or draft status.
+This module never approves or executes a draft. If the final output fails
+revalidation after the human pause, it retires the gate's still-actionable
+drafts in the same transaction as the failed status. The approval service owns
+human decisions; approved-only executors own tracker and calendar effects.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -32,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from proofpath.config import Settings
 from proofpath.db.models import ActionDraft, ActionDraftStatus, AnalysisRun, AnalysisRunStatus
 from proofpath.db.repositories.analysis import AnalysisRepo
+from proofpath.db.repositories.draft import DraftRepo
 from proofpath.graph.approval import (
     ApprovalError,
     ApprovalStateError,
@@ -42,6 +42,7 @@ from proofpath.graph.nodes import EvidenceComparator, SprintPlanner
 from proofpath.graph.state import ApprovalDecision
 from proofpath.graph.workflow import build_workflow, workflow_config
 from proofpath.ingestion.analyse_role import RoleParserBackend
+from proofpath.policy.output_guard import OUTPUT_CONTRACT_REJECTED
 from proofpath.retrieval.embeddings import EmbeddingClient
 
 
@@ -94,8 +95,12 @@ async def _set_status(
     session_factory: async_sessionmaker[AsyncSession],
     run_id: uuid.UUID,
     status: AnalysisRunStatus,
+    *,
+    invalidate_drafts: Collection[UUID] = (),
 ) -> None:
     async with session_factory.begin() as session:
+        if invalidate_drafts:
+            await DraftRepo(session).invalidate_gate_drafts(run_id, invalidate_drafts)
         await AnalysisRepo(session).update_run_metrics(run_id, status=status)
 
 
@@ -181,7 +186,10 @@ async def resume_approval_run(
         raise ApprovalError("Approval gate recorded a decision that was not requested.")
 
     status = AnalysisRunStatus.FAILED if errors or interrupted else AnalysisRunStatus.COMPLETED
-    await _set_status(session_factory, run.id, status)
+    rejected = any(error["code"] == OUTPUT_CONTRACT_REJECTED for error in errors)
+    await _set_status(
+        session_factory, run.id, status, invalidate_drafts=paused.draft_ids if rejected else ()
+    )
     return ApprovalResumeResult(
         analysis_run_id=run.id,
         thread_id=thread_id,

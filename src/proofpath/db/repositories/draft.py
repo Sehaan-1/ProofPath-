@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
@@ -155,6 +156,28 @@ class DraftRepo:
         )
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def invalidate_gate_drafts(
+        self, run_id: uuid.UUID, draft_ids: Collection[uuid.UUID]
+    ) -> None:
+        """Retire only this invalidated approval request, without undoing past executions.
+
+        A pending draft is withdrawn; an already-committed human approval retains
+        its approval timestamp but can no longer execute, including on replay.
+        """
+        for before, after in (
+            (ActionDraftStatus.PENDING_APPROVAL, ActionDraftStatus.REJECTED),
+            (ActionDraftStatus.APPROVED, ActionDraftStatus.FAILED),
+        ):
+            await self._session.execute(
+                update(ActionDraft)
+                .where(
+                    ActionDraft.analysis_run_id == run_id,
+                    ActionDraft.id.in_(draft_ids),
+                    ActionDraft.status == before,
+                )
+                .values(status=after)
+            )
 
     async def claim_decision(
         self,

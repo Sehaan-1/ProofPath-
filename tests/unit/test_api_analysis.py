@@ -47,6 +47,9 @@ def app_services(monkeypatch):
     app.state.session_factory.begin = begin
     opp_id = uuid4()
     req_id = uuid4()
+    chunk_id = uuid4()
+    ledger = MagicMock(get_existing_chunk_ids=AsyncMock(return_value={chunk_id}))
+    monkeypatch.setattr(analysis_routes, "EvidenceRepo", lambda _session: ledger)
     req = SimpleNamespace(
         id=req_id,
         opportunity_id=opp_id,
@@ -89,24 +92,6 @@ def app_services(monkeypatch):
         async def get_run_by_id(self, run_id, **kwargs):
             return runs.get(run_id)
 
-        async def upsert_verdicts(self, run_id, verdicts):
-            runs[run_id].claim_verdicts = [
-                SimpleNamespace(
-                    **{
-                        name: getattr(v, name)
-                        for name in (
-                            "requirement_id",
-                            "verdict",
-                            "claim_summary",
-                            "cited_chunk_ids",
-                            "policy_downgraded",
-                            "gap_notes",
-                        )
-                    }
-                )
-                for v in verdicts
-            ]
-
     monkeypatch.setattr(analysis_routes, "AnalysisRepo", Repo)
     # `execute_analysis_graph` (in `proofpath.jobs`) resolves AnalysisRepo and
     # build_workflow from the jobs module, so patch there too.
@@ -132,6 +117,9 @@ def app_services(monkeypatch):
     graph.ainvoke = AsyncMock(
         return_value={
             "policy_verified": True,
+            "output_validated": True,
+            "tool_trace": ["search_evidence", "create_action_draft"],
+            "injection_detected": True,
             "errors": [],
             "draft_actions": [object()],
             "__interrupt__": (approval_interrupt,),
@@ -140,12 +128,26 @@ def app_services(monkeypatch):
                     requirement_id=req_id,
                     verdict=VerdictType.SUPPORTED,
                     claim_summary="Grounded",
-                    cited_chunk_ids=[uuid4()],
+                    cited_chunk_ids=[chunk_id],
                 )
             ],
         }
     )
-    monkeypatch.setattr(jobs, "build_workflow", lambda **_kwargs: graph)
+
+    def build(*, analysis_run_id, **_kwargs):
+        async def invoke(*args):
+            result = await graph.ainvoke(*args)
+            # The real graph commits these rows with its draft transaction.
+            if result.get("output_validated"):
+                runs[analysis_run_id].claim_verdicts = result["verdicts"]
+            app.state.checkpointer.aget_tuple.return_value = SimpleNamespace(
+                checkpoint={"channel_values": result.copy()}
+            )
+            return result
+
+        return SimpleNamespace(ainvoke=invoke)
+
+    monkeypatch.setattr(jobs, "build_workflow", build)
 
     # Async path: a job queue on app state and a mocked enqueue_job.
     app.state.job_queue = MagicMock()
@@ -164,12 +166,13 @@ def app_services(monkeypatch):
         client.close()
 
 
-def test_analysis_run_persists_only_verified_verdicts_and_report(app_services):
+def test_analysis_run_returns_only_validated_persisted_verdicts(app_services):
     client, graph, runs, opp_id, req_id, _ = app_services
     response = client.post("/api/v1/analyses/run", json={"opportunity_id": str(opp_id)})
     assert response.status_code == 201
     report = response.json()
     assert report["status"] == "awaiting_approval"
+    assert report["injection_detected"] is True
     assert report["verdicts"][0]["requirement_id"] == str(req_id)
     run_id = next(iter(runs))
     assert client.get(f"/api/v1/analyses/{run_id}").json()["verdicts"] == report["verdicts"]
@@ -181,6 +184,8 @@ def test_pause_outside_approval_gate_is_failed_not_approvable(app_services):
     client, graph, runs, opp_id, _, _ = app_services
     graph.ainvoke.return_value = {
         "policy_verified": True,
+        "output_validated": True,
+        "tool_trace": [],
         "errors": [],
         "draft_actions": [object()],
         "__interrupt__": (Interrupt(value="continue?"),),
@@ -211,6 +216,47 @@ def test_graph_failure_is_failed_and_never_persists_unverified_verdicts(app_serv
     assert response.json()["status"] == "failed"
     assert response.json()["verdicts"] == []
     assert next(iter(runs.values())).status == AnalysisRunStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    "corruption", ["unvalidated", "missing_trace", "forbidden", "missing_citation"]
+)
+def test_report_never_serves_unverifiable_historical_output(app_services, corruption):
+    client, _, runs, opp_id, _, _ = app_services
+    assert (
+        client.post("/api/v1/analyses/run", json={"opportunity_id": str(opp_id)}).status_code == 201
+    )
+    run = next(iter(runs.values()))
+    state = client.app.state.checkpointer.aget_tuple.return_value.checkpoint["channel_values"]
+    if corruption == "unvalidated":
+        del state["output_validated"]
+    elif corruption == "missing_trace":
+        del state["tool_trace"]
+    elif corruption == "forbidden":
+        state["tool_trace"].append("approve_action")
+    else:
+        run.claim_verdicts[0] = run.claim_verdicts[0].model_copy(
+            update={"cited_chunk_ids": [uuid4()]}
+        )
+    response = client.get(f"/api/v1/analyses/{run.id}")
+    assert response.status_code == 409
+    assert "Grounded" not in response.text
+
+
+def test_failed_contract_hides_stale_persisted_rows_and_checkpoint_sprint(app_services):
+    client, graph, runs, opp_id, _, _ = app_services
+    graph.ainvoke.return_value["output_validated"] = False
+    response = client.post("/api/v1/analyses/run", json={"opportunity_id": str(opp_id)})
+    assert response.json()["status"] == "failed"
+    run = next(iter(runs.values()))
+    run.claim_verdicts = graph.ainvoke.return_value["verdicts"]
+    run.action_drafts = [object()]
+    state = client.app.state.checkpointer.aget_tuple.return_value.checkpoint["channel_values"]
+    state["contribution_sprint"] = {"private": "rejected output"}
+    result = client.get(f"/api/v1/analyses/{run.id}").json()
+    assert result["verdicts"] == []
+    assert result["contribution_sprint"] is None
+    assert result["action_drafts"] == []
 
 
 def test_async_analysis_enqueues_job_and_returns_202(app_services):

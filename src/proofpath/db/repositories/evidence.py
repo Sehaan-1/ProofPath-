@@ -214,11 +214,17 @@ class EvidenceRepo:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_existing_chunk_ids(self, chunk_ids: Sequence[uuid.UUID]) -> set[uuid.UUID]:
-        """Return the subset of `chunk_ids` that actually exist in the Evidence Ledger."""
+    async def get_existing_chunk_ids(
+        self, chunk_ids: Sequence[uuid.UUID], *, for_reference: bool = False
+    ) -> set[uuid.UUID]:
+        """Return actual ledger IDs; optionally protect referenced keys until commit."""
         if not chunk_ids:
             return set()
         stmt = select(EvidenceChunk.id).where(EvidenceChunk.id.in_(chunk_ids))
+        if for_reference:
+            # The verdicts store UUID arrays rather than FKs. Prevent a concurrent
+            # deletion between the final check and publication, not after commit.
+            stmt = stmt.order_by(EvidenceChunk.id).with_for_update(read=True, key_share=True)
         result = await self._session.execute(stmt)
         return set(result.scalars().all())
 

@@ -19,7 +19,11 @@ COPY pyproject.toml alembic.ini ./
 COPY src/ ./src/
 COPY migrations/ ./migrations/
 
-RUN pip install .
+ARG ENABLE_GUARDRAILS=false
+RUN case "$(echo "$ENABLE_GUARDRAILS" | tr '[:upper:]' '[:lower:]')" in \
+      1|true|yes|on|t|y) pip install '.[guardrails]' ;; \
+      *) pip install . ;; \
+    esac
 
 # Run the worker as a non-root user.
 RUN useradd --create-home --uid 1000 proofpath \

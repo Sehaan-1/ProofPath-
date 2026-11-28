@@ -15,7 +15,10 @@ thread. The facade enforces synchronous checkpoint writes and a fixed recursion
 limit regardless of caller-provided settings. `step_budget` is capped at 100;
 LangGraph's recursion limit includes additional steps for error handling.
 A calendar draft is created only when explicit start/end times are supplied
-for a generated sprint.
+for a generated sprint. In the last tool-using node the final citation/trace
+check, verdict upsert and draft writes share one transaction. Only a checked
+result gets `output_validated=True`. `tool_trace` records names only, and is
+independent of both the JD and any external observability backend.
 
 A node failure is routed to `fallback_error` after its transaction rolls back.
 The result retains completed state, includes a sanitized `errors` entry, and
@@ -53,7 +56,8 @@ resumed = await graph.aresume(
 `{"decision": "approved" | "rejected", "draft_id": "<uuid>"}` is validated inside
 the node on replay: exactly those two keys, an exact decision string, and a draft
 id from the pending request. Anything else raises and the run routes to the
-fallback error node. The gate only records an `ApprovalDecision` in state;
+fallback error node. After `interrupt()` returns, the gate rechecks the ledger and
+trace before recording an `ApprovalDecision` in state;
 committing approvals to `action_drafts` (Slice 2.1.2) and approved-only side
 effects (Slice 2.1.3) happen outside the graph.
 

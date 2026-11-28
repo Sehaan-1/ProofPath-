@@ -36,6 +36,7 @@ from proofpath.ingestion.markdown_ingester import IngestStatus, persist_parsed_d
 from proofpath.ingestion.resume_parser import ParsedDocument, hash_bytes, parse_resume_text
 from proofpath.ingestion.secure_job_fetcher import SecureJobPageFetcher
 from proofpath.jobs import GITHUB_INGEST_TASK, GithubIngestJobPayload, enqueue_job
+from proofpath.policy.output_guard import OutputContractError
 from proofpath.retrieval.embeddings import create_embedding_client
 from proofpath.retrieval.hybrid_search import HybridSearcher
 from proofpath.schemas.actions import TrackerRecord
@@ -324,6 +325,6 @@ async def create_opportunity(
         raise HTTPException(422, "Job description is empty.") from exc
     except JobPageFetchError as exc:
         raise HTTPException(422, "Job posting could not be fetched safely.") from exc
-    except RoleParseError as exc:
+    except (RoleParseError, OutputContractError) as exc:
         raise HTTPException(502, "Job description could not be parsed.") from exc
     return result.to_response()

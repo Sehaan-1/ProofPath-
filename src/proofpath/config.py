@@ -131,6 +131,10 @@ class Settings(BaseSettings):
         le=5,
         description="Hard upper bound on LangGraph policy/tool retry loops.",
     )
+    enable_guardrails: bool = Field(
+        default=False,
+        description="Also check final output with the local Guardrails AI validator (guardrails extra).",
+    )
     redact_pii: bool = Field(
         default=False,
         description="Mask personal phone numbers/addresses before external LLM calls.",

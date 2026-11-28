@@ -1,5 +1,10 @@
-"""Deterministic safety policy for the Evidence Ledger and tool allowlist."""
+"""Deterministic input screening, Evidence Ledger policy, and tool allowlist."""
 
+from proofpath.policy.injection_guard import (
+    contains_jd_injection,
+    mask_pii,
+    neutralize_jd_instructions,
+)
 from proofpath.policy.ledger_validator import (
     CITATION_MISSING_EVENT,
     CLAIM_DOWNGRADED_EVENT,
@@ -14,6 +19,7 @@ from proofpath.policy.ledger_validator import (
     check_citation_existence,
     chunk_supports_entity,
 )
+from proofpath.policy.output_guard import OutputContractError, OutputGuard, validate_final_output
 from proofpath.policy.tool_allowlist import (
     ALL_TOOL_NAMES,
     APPROVAL_CONFIRMATION_PHRASE,
@@ -48,6 +54,8 @@ __all__ = [
     "DowngradeResult",
     "LedgerPolicyResult",
     "LedgerValidator",
+    "OutputContractError",
+    "OutputGuard",
     "ToolAccess",
     "ToolName",
     "ToolNotAllowedError",
@@ -55,9 +63,13 @@ __all__ = [
     "apply_unsupported_downgrade",
     "check_citation_existence",
     "chunk_supports_entity",
+    "contains_jd_injection",
     "is_allowed",
     "is_approval_gated",
     "is_forbidden",
     "is_read_only",
+    "mask_pii",
+    "neutralize_jd_instructions",
     "require_allowed",
+    "validate_final_output",
 ]

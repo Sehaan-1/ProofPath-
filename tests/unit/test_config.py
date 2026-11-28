@@ -38,6 +38,7 @@ _MANAGED_ENV_VARS = (
     "OBSERVABILITY_BACKEND",
     "MAX_AGENT_RETRIES",
     "REDACT_PII",
+    "ENABLE_GUARDRAILS",
     "JOB_MAX_ATTEMPTS",
     "JOB_RETRY_BACKOFF_SECONDS",
 )
@@ -64,6 +65,7 @@ def test_settings_defaults() -> None:
     assert settings.embedding_dimensions == 1536
     assert settings.observability_backend is ObservabilityBackend.NONE
     assert settings.max_agent_retries == 2
+    assert settings.enable_guardrails is False
     assert settings.redact_pii is False
     assert settings.job_max_attempts == 3
     assert settings.job_retry_backoff_seconds == [2, 8, 30]
@@ -92,6 +94,7 @@ def test_settings_loads_all_env_vars_and_masks_secrets(
     monkeypatch.setenv("OBSERVABILITY_BACKEND", "LangFuse")
     monkeypatch.setenv("MAX_AGENT_RETRIES", "3")
     monkeypatch.setenv("LOG_LEVEL", "debug")
+    monkeypatch.setenv("ENABLE_GUARDRAILS", "true")
     monkeypatch.setenv("REDACT_PII", "true")
 
     settings = Settings(_env_file=None)
@@ -107,6 +110,7 @@ def test_settings_loads_all_env_vars_and_masks_secrets(
     assert settings.observability_backend is ObservabilityBackend.LANGFUSE
     assert settings.max_agent_retries == 3
     assert settings.log_level is LogLevel.DEBUG
+    assert settings.enable_guardrails is True
     assert settings.redact_pii is True
 
     # Secrets must never appear in repr/str/model_dump output.

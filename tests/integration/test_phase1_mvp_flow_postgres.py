@@ -39,6 +39,7 @@ from proofpath.graph.state import PolicyViolation
 from proofpath.main import create_app
 from proofpath.mcp_server import create_mcp_server
 from proofpath.policy.ledger_validator import CLAIM_DOWNGRADED_EVENT
+from proofpath.policy.tool_allowlist import ALL_TOOL_NAMES
 from proofpath.schemas import (
     ActionDraftRecord,
     AnalysisReport,
@@ -266,11 +267,11 @@ async def test_phase1_exit_criteria_end_to_end_api_langgraph_and_mcp(
         lambda _settings: DeterministicPANWRoleParser(),
     )
     monkeypatch.setattr(
-        "proofpath.api.analysis_routes.create_role_parser",
+        "proofpath.graph.dependencies.create_role_parser",
         lambda _settings: DeterministicPANWRoleParser(),
     )
     monkeypatch.setattr(
-        "proofpath.api.analysis_routes.create_graph_backend",
+        "proofpath.graph.dependencies.create_graph_backend",
         lambda _settings: DeterministicGraphBackend(),
     )
 
@@ -480,12 +481,7 @@ async def test_phase1_exit_criteria_end_to_end_api_langgraph_and_mcp(
             mcp_server = create_mcp_server(settings=settings)
             async with Client(mcp_server) as mcp_client:
                 listed = await mcp_client.list_tools()
-                assert {t.name for t in listed.tools} == {
-                    "search_evidence",
-                    "get_opportunity",
-                    "get_application_status",
-                    "get_action_draft",
-                }
+                assert {t.name for t in listed.tools} == ALL_TOOL_NAMES
 
                 # Search evidence over MCP and verify chunks from ingested resume + GitHub repos.
                 mcp_search = await mcp_client.call_tool(

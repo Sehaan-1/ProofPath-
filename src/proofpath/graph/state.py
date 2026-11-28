@@ -87,12 +87,15 @@ class ProofPathState(TypedDict):
     """Analysis state. Keys other than the opportunity may be absent in partial updates."""
 
     opportunity_id: uuid.UUID
+    injection_detected: NotRequired[bool]
+    tool_trace: NotRequired[list[str]]
     requirements: NotRequired[list[RequirementRecord]]
     retrieved_evidence: NotRequired[dict[str, list[EvidenceSnippet]]]
     verdicts: NotRequired[list[ClaimVerdictSchema]]
     policy_violations: NotRequired[list[PolicyViolation]]
     policy_retry: NotRequired[bool]
     policy_verified: NotRequired[bool]
+    output_validated: NotRequired[bool]
     contribution_sprint: NotRequired[ContributionSprintPlan | None]
     draft_actions: NotRequired[list[ActionDraftRecord]]
     approval_request: NotRequired[ApprovalRequest | None]
@@ -111,6 +114,9 @@ def initial_state(opportunity_id: uuid.UUID, *, settings: Settings | None = None
     active_settings = settings if settings is not None else get_settings()
     return {
         "opportunity_id": opportunity_id,
+        "injection_detected": False,
+        "tool_trace": [],
+        "output_validated": False,
         "requirements": [],
         "retrieved_evidence": {},
         "verdicts": [],

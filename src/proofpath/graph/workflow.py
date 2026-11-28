@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
+from functools import partial
 from typing import Any
 from uuid import UUID
 
@@ -28,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proofpath.config import Settings
 from proofpath.db.models import AuditActor
-from proofpath.db.repositories.analysis import AnalysisRepo
+from proofpath.db.repositories.analysis import AnalysisRepo, ClaimVerdictInput
 from proofpath.db.repositories.audit import AuditRepo
 from proofpath.db.repositories.evidence import EvidenceRepo
 from proofpath.graph.approval import approval_gate_node, pending_approval_request
@@ -49,6 +50,13 @@ from proofpath.graph.nodes import (
 from proofpath.graph.state import ApprovalRequest, GraphError, ProofPathState
 from proofpath.ingestion.analyse_role import RoleParserBackend, is_retryable_role_parse_error
 from proofpath.policy.ledger_validator import LedgerValidator
+from proofpath.policy.output_guard import (
+    OUTPUT_CONTRACT_REJECTED,
+    OutputContractError,
+    optional_output_guard,
+    validate_final_output,
+)
+from proofpath.policy.tool_trace import collect_tool_calls
 from proofpath.retrieval.embeddings import EmbeddingClient
 from proofpath.retrieval.hybrid_search import HybridSearcher
 
@@ -206,28 +214,74 @@ def build_workflow(
         guard(state, config)
         return await recommend_contribution_sprint_node(state, planner=sprint_planner)
 
+    async def check_output(state: ProofPathState, session: AsyncSession) -> None:
+        if not state.get("policy_verified") or state.get("policy_retry"):
+            raise OutputContractError("The comparison policy has not verified these verdicts.")
+        await validate_final_output(
+            state.get("verdicts", []),
+            state.get("tool_trace"),
+            lookup=partial(EvidenceRepo(session).get_existing_chunk_ids, for_reference=True),
+            extra_guard=optional_output_guard(settings),
+        )
+
+    async def publish_output(state: ProofPathState, session: AsyncSession) -> None:
+        await check_output(state, session)
+        await AnalysisRepo(session).upsert_verdicts(
+            analysis_run_id,
+            [
+                ClaimVerdictInput(
+                    requirement_id=v.requirement_id,
+                    verdict=v.verdict,
+                    claim_summary=v.claim_summary,
+                    cited_chunk_ids=v.cited_chunk_ids,
+                    policy_downgraded=v.policy_downgraded,
+                    gap_notes=v.gap_notes,
+                )
+                for v in state.get("verdicts", [])
+            ],
+        )
+
     async def drafts(state: ProofPathState, config: RunnableConfig) -> dict[str, object]:
         guard(state, config)
         async with session_factory.begin() as session:
-            return await create_action_drafts_node(
+            updates = await create_action_drafts_node(
                 state,
                 session=session,
                 analysis_run_id=analysis_run_id,
                 calendar_start=calendar_start,
                 calendar_end=calendar_end,
             )
+            # The last tool-using node and the first publication boundary. Include
+            # this node's actual calls, and roll back its pending drafts on rejection.
+            await publish_output(state, session)
+            return {
+                "draft_actions": updates["draft_actions"],
+                "step_count": updates["step_count"],
+                "output_validated": True,
+            }
 
     async def approval(state: ProofPathState, config: RunnableConfig) -> dict[str, object]:
         guard(state, config)
-        return await approval_gate_node(state, analysis_run_id=analysis_run_id)
+        if not state.get("output_validated"):
+            raise OutputContractError("The analysis has no validated final output.")
+        decision = await approval_gate_node(state, analysis_run_id=analysis_run_id)
+        # Only reached on resume. Evidence may have disappeared during the human
+        # pause; validate again before returning the terminal state. No new draft,
+        # verdict or decision is committed by this read-only check.
+        async with session_factory.begin() as session:
+            await check_output(state, session)
+        return decision
 
     def wrap_node(name: str, node: Node) -> Node:
         async def guarded(state: ProofPathState, config: RunnableConfig) -> dict[str, object]:
             # Thread mismatch is an authorization/configuration failure, not a graph error.
             if config.get("configurable", {}).get("thread_id") != thread_id:
                 raise ValueError("Graph invocation thread_id does not match analysis run")
+            working = state.copy()
             try:
-                return await node(state, config)
+                with collect_tool_calls(state.get("tool_trace")) as calls:
+                    working["tool_trace"] = calls
+                    updates = await node(working, config)
             except GraphBubbleUp:
                 raise
             except Exception as exc:
@@ -242,15 +296,45 @@ def build_workflow(
                     or is_retryable_role_parse_error(exc)
                     or (exc.__cause__ is not None and is_retryable_role_parse_error(exc.__cause__)),
                 }
-                return {"pending_error": error}
+                if isinstance(exc, OutputContractError):
+                    error = contract_error(name, exc)
+                updates = {"pending_error": error}
+            # Only the dispatcher supplies this channel, including calls in a failed node.
+            if "tool_trace" in working:
+                updates["tool_trace"] = working["tool_trace"]
+            return updates
 
         return guarded
+
+    def contract_error(node: str, exc: OutputContractError) -> GraphError:
+        return {
+            "node": node,
+            "code": OUTPUT_CONTRACT_REJECTED,
+            "message": str(exc),
+            "retryable": False,
+        }
 
     async def fallback_error_node(state: ProofPathState) -> dict[str, object]:
         error = state.get("pending_error")
         if error is None:
             raise ValueError("Fallback requires a pending error")
         errors = [*state.get("errors", []), error]
+        # Preserve a useful partial report on unrelated failures, but only after
+        # checking its actual citations and *complete* trace (including the failure).
+        publish_partial = False
+        if state.get("policy_verified") and error["code"] != OUTPUT_CONTRACT_REJECTED:
+            try:
+                async with session_factory.begin() as session:
+                    await publish_output(state, session)
+                publish_partial = True
+            except OutputContractError as exc:
+                errors.append(contract_error("final_output", exc))
+            except Exception:
+                errors.append(
+                    contract_error(
+                        "final_output", OutputContractError("Final validation unavailable.")
+                    )
+                )
         try:
             async with session_factory.begin() as session:
                 await AuditRepo(session).record(
@@ -278,10 +362,19 @@ def build_workflow(
             "errors": errors,
             "pending_error": None,
             "policy_retry": False,
+            "output_validated": publish_partial,
         }
-        if not state.get("policy_verified", False):
-            # Unverified model output must not be presented as evidence-backed.
-            updates.update({"verdicts": [], "contribution_sprint": None})
+        if not publish_partial:
+            updates.update(
+                {
+                    "verdicts": [],
+                    "contribution_sprint": None,
+                    "draft_actions": [],
+                    "approval_request": None,
+                    "approval_decision": None,
+                    "policy_verified": False,
+                }
+            )
         return updates
 
     def route(default: str) -> Callable[[ProofPathState], str]:

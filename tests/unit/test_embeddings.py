@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 
 import httpx
 import pytest
 import respx
+from pydantic import SecretStr
 
 from proofpath.config import LLMProvider, Settings
 from proofpath.db.models import EMBEDDING_DIM
@@ -123,13 +125,50 @@ async def test_gemini_and_ollama_backends_post_expected_payloads() -> None:
 
 
 @pytest.mark.unit
-def test_factory_uses_hash_backend_for_local_model_name() -> None:
+async def test_factory_uses_hash_backend_for_local_model_name() -> None:
     settings = Settings(
         _env_file=None,
         llm_provider=LLMProvider.OPENAI,
         embedding_model="local-hash",
         embedding_dimensions=EMBEDDING_DIM,
+        redact_pii=True,
     )
     client = create_embedding_client(settings)
     assert isinstance(client._backend, HashEmbeddingBackend)
     assert client.dimensions == EMBEDDING_DIM
+    local = ["CV: 12 Main St. Tel: 415-555-0173"]
+    assert await client.embed(local) == await HashEmbeddingBackend().embed_batch(local)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("redact", [True, False])
+@pytest.mark.parametrize("provider", [LLMProvider.OPENAI, LLMProvider.GEMINI])
+async def test_hosted_embedding_requests_respect_pii_switch(provider, redact):
+    source = "CV: 42 Main Street; call 415-555-0123."
+    settings = Settings(
+        _env_file=None,
+        llm_provider=provider,
+        llm_api_key=SecretStr("test-key"),
+        embedding_model="test-model",
+        embedding_dimensions=64,
+        redact_pii=redact,
+    )
+    vector = [0.0] * 64
+    if provider == LLMProvider.OPENAI:
+        url = "https://api.openai.com/v1/embeddings"
+        response = {"data": [{"index": 0, "embedding": vector}]}
+    else:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/test-model:batchEmbedContents"
+        )
+        response = {"embeddings": [{"values": vector}]}
+    with respx.mock(assert_all_called=True) as router:
+        route = router.post(url).mock(return_value=httpx.Response(200, json=response))
+        assert await create_embedding_client(settings).embed_query(source) == vector
+        data = json.loads(route.calls.last.request.content)
+    sent = (
+        data["input"][0]
+        if provider == LLMProvider.OPENAI
+        else data["requests"][0]["content"]["parts"][0]["text"]
+    )
+    assert sent == ("CV: [REDACTED ADDRESS]; call [REDACTED PHONE]." if redact else source)
