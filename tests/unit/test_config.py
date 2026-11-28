@@ -32,6 +32,9 @@ _MANAGED_ENV_VARS = (
     "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS",
     "GITHUB_TOKEN",
+    "ENABLE_GOOGLE_CALENDAR",
+    "GOOGLE_CALENDAR_ID",
+    "GOOGLE_CALENDAR_ACCESS_TOKEN",
     "OBSERVABILITY_BACKEND",
     "MAX_AGENT_RETRIES",
     "REDACT_PII",
@@ -60,6 +63,10 @@ def test_settings_defaults() -> None:
     assert settings.observability_backend is ObservabilityBackend.NONE
     assert settings.max_agent_retries == 2
     assert settings.redact_pii is False
+    # Live Google Calendar writes are opt-in only, never on by default.
+    assert settings.enable_google_calendar is False
+    assert settings.google_calendar_id is None
+    assert settings.google_calendar_access_token is None
     assert settings.asyncpg_database_url.startswith("postgresql+asyncpg://")
     assert settings.psycopg_database_url.startswith("postgresql://")
 
@@ -115,11 +122,15 @@ def test_settings_loads_all_env_vars_and_masks_secrets(
 def test_blank_secrets_normalize_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_API_KEY", "   ")
     monkeypatch.setenv("GITHUB_TOKEN", "")
+    monkeypatch.setenv("GOOGLE_CALENDAR_ID", " ")
+    monkeypatch.setenv("GOOGLE_CALENDAR_ACCESS_TOKEN", "")
 
     settings = Settings(_env_file=None)
 
     assert settings.llm_api_key is None
     assert settings.github_token is None
+    assert settings.google_calendar_id is None
+    assert settings.google_calendar_access_token is None
 
     with pytest.raises(ValueError, match="LLM_API_KEY"):
         settings.require_llm_api_key()
@@ -152,6 +163,28 @@ def test_invalid_settings_fail_validation(
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+@pytest.mark.unit
+def test_google_calendar_opt_in_requires_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENABLE_GOOGLE_CALENDAR", "true")
+
+    with pytest.raises(ValidationError, match="GOOGLE_CALENDAR_ID"):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("GOOGLE_CALENDAR_ID", "primary")
+    with pytest.raises(ValidationError, match="GOOGLE_CALENDAR_ACCESS_TOKEN"):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("GOOGLE_CALENDAR_ACCESS_TOKEN", "token")
+    settings = Settings(_env_file=None)
+    assert settings.enable_google_calendar is True
+    assert settings.google_calendar_id is not None
+    assert settings.google_calendar_access_token is not None
+    assert settings.google_calendar_access_token.get_secret_value() == "token"
+    # Secrets never render in logs/reprs.
+    assert "secret-value" not in repr(settings)
+    assert "SecretStr('**********')" in repr(settings)
 
 
 @pytest.mark.unit

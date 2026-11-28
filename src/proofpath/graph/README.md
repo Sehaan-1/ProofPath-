@@ -62,6 +62,13 @@ commits the decision with one compare-and-set on the draft row and then resumes
 the run; a repeated request returns `already_processed` without re-deciding, so an
 approval can never be applied twice.
 
+Approved-only side effects live entirely outside the graph, in
+`proofpath.execution.DraftExecutor`: once the resume finishes, the executor runs for
+`approved` drafts only, advances `application_tracker`, writes the local calendar
+task (served as a downloadable `.ics`), and appends the immutable `audit_logs`
+record that carries the approval timestamp. No graph node ever performs those
+writes, and no draft is executed without a committed human approval.
+
 `proofpath.graph.resume.resume_approval_run` is the service layer for that flow:
 it resolves the run from the thread, requires `awaiting_approval` and a real gate
 pause, atomically claims the run out of `awaiting_approval` (so only one resume

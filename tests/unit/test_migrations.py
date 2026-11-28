@@ -42,9 +42,13 @@ def test_migration_history_has_single_linear_head() -> None:
     cfg = _make_alembic_config()
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    assert heads == ["0003_requirement_entity"]
+    assert heads == ["0004_calendar_tasks"]
     revisions = {rev.revision for rev in script.walk_revisions()}
-    assert {"0001_initial_schema", "0002_add_vector_and_fts_indexes"}.issubset(revisions)
+    assert {
+        "0001_initial_schema",
+        "0002_add_vector_and_fts_indexes",
+        "0003_requirement_entity",
+    }.issubset(revisions)
 
 
 @pytest.mark.unit
@@ -69,6 +73,8 @@ def test_offline_upgrade_emits_all_tables_and_constraints() -> None:
     assert "ck_claim_verdicts_supported_requires_citations" in sql
     assert "ck_action_drafts_execution_requires_approval" in sql
     assert "ck_action_drafts_executed_status_requires_timestamps" in sql
+    assert "uq_calendar_tasks_action_draft_id" in sql
+    assert "ck_calendar_tasks_end_after_start" in sql
     assert "_ck_" not in sql
 
 

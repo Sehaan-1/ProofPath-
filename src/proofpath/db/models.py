@@ -611,6 +611,59 @@ class ActionDraft(Base):
     analysis_run: Mapped[AnalysisRun] = relationship(back_populates="action_drafts")
 
 
+class CalendarTask(Base):
+    """Local calendar/task entry materialized from one approved `calendar_block` draft.
+
+    Sub-part 2.1.3b: written only by the approved-only executor, never by the
+    analysis graph. `action_draft_id` is unique, so executing the same draft twice
+    cannot create a second task; `ics_uid` is deterministic per draft, which keeps
+    re-generated `.ics` invites identical.
+    """
+
+    __tablename__ = "calendar_tasks"
+    __table_args__ = (
+        CheckConstraint("end_at > start_at", name="end_after_start"),
+        UniqueConstraint("action_draft_id"),
+        UniqueConstraint("ics_uid"),
+        Index("ix_calendar_tasks_opportunity_id", "opportunity_id"),
+        Index("ix_calendar_tasks_start_at", "start_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    action_draft_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("action_drafts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    opportunity_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("opportunities.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    timezone: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="UTC",
+        server_default=text("'UTC'"),
+    )
+    ics_uid: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utc_now,
+        server_default=func.now(),
+    )
+
+
 class AuditLog(Base):
     """Immutable append-only audit log for agent actions, policy events, and approvals."""
 

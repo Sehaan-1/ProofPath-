@@ -1,8 +1,10 @@
 """Approval decision idempotency (Sub-slice 2.1.2).
 
 The service is exercised against an in-memory world: a draft, its run, a fake
-`DraftRepo.claim_decision` compare-and-set, and a fake resume. Real PostgreSQL
-behaviour is covered by `tests/integration/test_api_approval_postgres.py`.
+`DraftRepo.claim_decision` compare-and-set, a fake approved-only executor, and a
+fake resume. Real PostgreSQL behaviour (including the executors) is covered by
+`tests/integration/test_api_approval_postgres.py` and
+`tests/integration/test_executors_postgres.py`.
 """
 
 from __future__ import annotations
@@ -25,6 +27,11 @@ from proofpath.db.models import (
     ApplicationStage,
 )
 from proofpath.db.repositories.draft import decided_status
+from proofpath.execution import (
+    DraftExecution,
+    DraftNotExecutableError,
+    ExecutionOutcome,
+)
 from proofpath.graph.approval import ApprovalError, ApprovalStateError
 from proofpath.graph.dependencies import GraphDependencies
 
@@ -57,7 +64,12 @@ class World:
             idempotency_key="proofpath:run:tracker_upsert",
             approved_at=(
                 datetime.now(UTC)
-                if draft_status in {ActionDraftStatus.APPROVED, ActionDraftStatus.EXECUTED}
+                if draft_status
+                in {
+                    ActionDraftStatus.APPROVED,
+                    ActionDraftStatus.EXECUTED,
+                    ActionDraftStatus.FAILED,
+                }
                 else None
             ),
             executed_at=None,
@@ -71,6 +83,7 @@ class World:
         self.race_winner = race_winner
         self.claims: list[str] = []
         self.resumes: list[dict[str, Any]] = []
+        self.executions: list[ExecutionOutcome] = []
 
     # --- fake repository behaviour -------------------------------------
     def draft_repo(self) -> Any:
@@ -119,6 +132,42 @@ class World:
 
         return Repo
 
+    def executor(self) -> Any:
+        world = self
+
+        class Executor:
+            def __init__(
+                self,
+                *,
+                session_factory: object,
+                settings: object = None,
+                http_client: object = None,
+            ) -> None:
+                pass
+
+            async def execute(self, draft_id: uuid.UUID) -> DraftExecution:
+                if draft_id != world.draft.id:
+                    raise DraftNotExecutableError("unknown draft")
+                draft = world.draft
+                if draft.status is ActionDraftStatus.EXECUTED:
+                    outcome = ExecutionOutcome.ALREADY_EXECUTED
+                elif draft.status is ActionDraftStatus.APPROVED and draft.approved_at is not None:
+                    draft.status = ActionDraftStatus.EXECUTED
+                    draft.executed_at = datetime.now(UTC)
+                    outcome = ExecutionOutcome.EXECUTED
+                else:
+                    raise DraftNotExecutableError("draft is not human-approved")
+                world.executions.append(outcome)
+                return DraftExecution(
+                    draft_id=draft.id,
+                    action_type=draft.action_type,
+                    outcome=outcome,
+                    approved_at=draft.approved_at,
+                    executed_at=draft.executed_at,
+                )
+
+        return Executor
+
     async def resume(self, **kwargs: Any) -> None:
         self.resumes.append(kwargs)
         if self.resume_outcome == "state_error":
@@ -146,6 +195,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, world: World) -> tuple[MagicMock, 
     factory.begin = lambda: context()
 
     monkeypatch.setattr(approvals_module, "DraftRepo", world.draft_repo())
+    monkeypatch.setattr(approvals_module, "DraftExecutor", world.executor())
     monkeypatch.setattr(approvals_module, "AnalysisRepo", world.analysis_repo())
     monkeypatch.setattr(approvals_module, "resume_approval_run", world.resume)
     return factory, session
@@ -179,8 +229,13 @@ async def test_approve_commits_once_and_finishes_the_run(monkeypatch) -> None:
 
     assert result.decision == "approved"
     assert result.already_processed is False
-    assert result.draft.status is ActionDraftStatus.APPROVED
+    # Approval is committed, then the approved-only executor materializes it.
+    assert result.draft.status is ActionDraftStatus.EXECUTED
     assert result.draft.approved_at is not None
+    assert result.execution is not None
+    assert result.execution.outcome is ExecutionOutcome.EXECUTED
+    assert result.execution.approved_at == result.draft.approved_at
+    assert world.executions == [ExecutionOutcome.EXECUTED]
     assert result.run_status is AnalysisRunStatus.COMPLETED
     assert result.thread_id == world.run.thread_id
     assert world.claims == ["approved"]
@@ -204,6 +259,12 @@ async def test_approving_twice_never_reapplies_the_decision(monkeypatch) -> None
     # The decision CAS ran exactly once; the run was not resumed a second time.
     assert world.claims == ["approved"]
     assert len(world.resumes) == 1
+    # The replay re-runs the (idempotent) executor and performs no second side effect.
+    assert first.execution is not None
+    assert first.execution.outcome is ExecutionOutcome.EXECUTED
+    assert second.execution is not None
+    assert second.execution.outcome is ExecutionOutcome.ALREADY_EXECUTED
+    assert world.executions == [ExecutionOutcome.EXECUTED, ExecutionOutcome.ALREADY_EXECUTED]
 
 
 async def test_reject_is_idempotent_and_never_resumes_twice(monkeypatch) -> None:
@@ -219,6 +280,10 @@ async def test_reject_is_idempotent_and_never_resumes_twice(monkeypatch) -> None
     assert world.claims == ["rejected"]
     assert len(world.resumes) == 1
     assert world.resumes[0]["decision"] == "rejected"
+    # Rejections never reach an executor.
+    assert first.execution is None
+    assert second.execution is None
+    assert world.executions == []
 
 
 @pytest.mark.parametrize(
@@ -239,12 +304,19 @@ async def test_contradictory_decisions_are_conflicts(monkeypatch, existing, deci
 
     assert world.claims == []
     assert world.resumes == []
+    assert world.executions == []
     assert world.draft.status is existing
 
 
-@pytest.mark.parametrize("existing", [ActionDraftStatus.EXECUTED, ActionDraftStatus.FAILED])
+@pytest.mark.parametrize(
+    ("existing", "expected_outcome"),
+    [
+        (ActionDraftStatus.EXECUTED, ExecutionOutcome.ALREADY_EXECUTED),
+        (ActionDraftStatus.FAILED, None),
+    ],
+)
 async def test_approved_draft_reports_already_processed_after_execution(
-    monkeypatch, existing
+    monkeypatch, existing, expected_outcome
 ) -> None:
     world = World(draft_status=existing, run_status=AnalysisRunStatus.COMPLETED)
     factory, _ = _install(monkeypatch, world)
@@ -254,6 +326,15 @@ async def test_approved_draft_reports_already_processed_after_execution(
     assert result.already_processed is True
     assert world.claims == []
     assert world.resumes == []
+    if expected_outcome is None:
+        # A failed execution is never retried implicitly: the decision stands, but
+        # no second side-effect attempt is reported.
+        assert result.execution is None
+        assert world.executions == []
+    else:
+        assert result.execution is not None
+        assert result.execution.outcome is expected_outcome
+        assert world.executions == [expected_outcome]
 
 
 async def test_missing_draft_or_run_is_not_found(monkeypatch) -> None:
@@ -302,7 +383,7 @@ async def test_decision_is_recorded_without_resuming_a_finalised_run(
 
     result = await decide_draft(**_kwargs(world, factory))
 
-    assert result.draft.status is ActionDraftStatus.APPROVED
+    assert result.draft.status is ActionDraftStatus.EXECUTED
     assert result.run_status is run_status
     assert world.resumes == []
 
@@ -313,7 +394,7 @@ async def test_resume_race_is_not_reported_as_a_failure(monkeypatch) -> None:
 
     result = await decide_draft(**_kwargs(world, factory))
 
-    assert result.draft.status is ActionDraftStatus.APPROVED
+    assert result.draft.status is ActionDraftStatus.EXECUTED
     assert len(world.resumes) == 1
 
 
@@ -323,8 +404,11 @@ async def test_resume_failure_keeps_the_committed_decision(monkeypatch) -> None:
 
     result = await decide_draft(**_kwargs(world, factory))
 
-    assert result.draft.status is ActionDraftStatus.APPROVED
+    assert result.draft.status is ActionDraftStatus.EXECUTED
     assert result.run_status is AnalysisRunStatus.FAILED
+    # A failed resume never rolls back an already-materialized side effect.
+    assert result.execution is not None
+    assert result.execution.outcome is ExecutionOutcome.EXECUTED
 
 
 async def test_invalid_decision_is_rejected_before_any_work(monkeypatch) -> None:
@@ -335,3 +419,4 @@ async def test_invalid_decision_is_rejected_before_any_work(monkeypatch) -> None
         await decide_draft(**_kwargs(world, factory, "maybe"))
 
     assert world.claims == []
+    assert world.executions == []

@@ -25,6 +25,7 @@ from proofpath.db.models import (
     AnalysisRunStatus,
     ApplicationStage,
 )
+from proofpath.execution import DraftExecution, ExecutionOutcome
 from proofpath.graph.dependencies import GraphDependenciesError
 from proofpath.main import create_app
 from proofpath.schemas.actions import ActionDraftRecord, TrackerUpsertPayload
@@ -105,11 +106,23 @@ def app_services(monkeypatch):
         client.close()
 
 
+def _execution(outcome: ExecutionOutcome = ExecutionOutcome.EXECUTED) -> DraftExecution:
+    return DraftExecution(
+        draft_id=uuid.uuid4(),
+        action_type=ActionType.TRACKER_UPSERT,
+        outcome=outcome,
+        approved_at=datetime.now(UTC),
+        executed_at=datetime.now(UTC) if outcome is ExecutionOutcome.EXECUTED else None,
+        audit_log_id=uuid.uuid4() if outcome is not ExecutionOutcome.FAILED else None,
+    )
+
+
 def _result(
     *,
     decision: str = "approved",
     already_processed: bool = False,
     run_status: AnalysisRunStatus = AnalysisRunStatus.COMPLETED,
+    execution: DraftExecution | None = None,
 ) -> DraftDecisionResult:
     row = _draft_row(
         status=(
@@ -136,6 +149,7 @@ def _result(
         already_processed=already_processed,
         run_status=run_status,
         thread_id="thread-1",
+        execution=execution,
     )
 
 
@@ -191,8 +205,45 @@ def test_approve_returns_the_committed_decision(app_services, monkeypatch):
     assert body["run_status"] == "completed"
     assert body["thread_id"] == "thread-1"
     assert body["draft"]["status"] == "approved"
+    assert body["execution"] is None
     assert calls[0]["draft_id"] == draft_id
     assert calls[0]["decision"] == "approved"
+
+
+def test_approve_reports_the_materialized_side_effect(app_services, monkeypatch):
+    client, _, _, _ = app_services
+    execution = _execution()
+
+    async def fake_decide(**kwargs):
+        return _result(execution=execution)
+
+    monkeypatch.setattr(draft_routes, "create_graph_dependencies", lambda _settings: object())
+    monkeypatch.setattr(draft_routes, "decide_draft", fake_decide)
+
+    response = client.post(f"/api/v1/drafts/{execution.draft_id}/approve")
+
+    assert response.status_code == 200
+    body = response.json()["execution"]
+    assert body["outcome"] == "executed"
+    assert body["action_type"] == "tracker_upsert"
+    assert body["audit_log_id"] == str(execution.audit_log_id)
+    assert body["executed_at"] is not None
+    assert body["error_code"] is None
+
+
+def test_rejection_never_reports_an_execution(app_services, monkeypatch):
+    client, _, _, _ = app_services
+
+    async def fake_decide(**kwargs):
+        return _result(decision="rejected")
+
+    monkeypatch.setattr(draft_routes, "create_graph_dependencies", lambda _settings: object())
+    monkeypatch.setattr(draft_routes, "decide_draft", fake_decide)
+
+    response = client.post(f"/api/v1/drafts/{uuid.uuid4()}/reject")
+
+    assert response.status_code == 200
+    assert response.json()["execution"] is None
 
 
 def test_reject_uses_the_rejected_decision(app_services, monkeypatch):

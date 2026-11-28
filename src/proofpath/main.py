@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from proofpath.api.analysis_routes import router as analysis_router
+from proofpath.api.calendar_routes import router as calendar_router
 from proofpath.api.draft_routes import router as draft_router
 from proofpath.api.routes import router
 from proofpath.config import Settings, get_settings
@@ -150,6 +151,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     application.include_router(router)
     application.include_router(analysis_router)
     application.include_router(draft_router)
+    application.include_router(calendar_router)
     return application
 
 

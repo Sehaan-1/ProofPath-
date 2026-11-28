@@ -15,15 +15,20 @@ in this order:
 2. **Finish the paused run.** The approval gate opened in Sub-slice 2.1.1 is
    resumed with ``Command(resume={"decision": ..., "draft_id": ...})`` on the
    run's own ``thread_id``; that resume is itself claimed atomically.
+3. **Materialize the approved side effect.** Only after the run is finished does
+   the approved-only executor run, so the resume guard still sees the draft as
+   ``approved`` and a resume failure can never strand a half-applied effect.
 
 Retries are safe in both directions: if the decision committed but the resume did
 not (process death in between), re-sending the same request completes the resume
 without re-deciding. If the run was already finalised, the decision request still
 returns the current state instead of failing.
 
-Side effects remain out of scope: nothing here mutates ``application_tracker``,
-calendars, or audit logs. Those are Sub-slice 2.1.3 executors, which run only for
-drafts a human approved here.
+Side effects are delegated to the approved-only executors (Sub-slice 2.1.3):
+after an approval is committed, ``proofpath.execution`` advances the tracker or
+materializes the calendar task and appends the immutable audit record. Rejections
+never execute anything, and a replayed approval is deduped by the draft row itself
+(``executed`` -> ``already_executed``, no second side effect).
 """
 
 from __future__ import annotations
@@ -43,6 +48,14 @@ from proofpath.db.repositories.draft import (
     DraftRepo,
     decision_satisfied,
     draft_record,
+)
+from proofpath.execution import (
+    DraftExecution,
+    DraftExecutor,
+    DraftNotExecutableError,
+)
+from proofpath.execution import (
+    DraftNotFoundError as ExecutionDraftNotFoundError,
 )
 from proofpath.graph.approval import ApprovalError, ApprovalStateError
 from proofpath.graph.dependencies import GraphDependencies
@@ -69,6 +82,7 @@ class DraftDecisionResult:
     already_processed: bool
     run_status: AnalysisRunStatus
     thread_id: str
+    execution: DraftExecution | None = None
 
 
 async def _apply_decision(
@@ -97,6 +111,31 @@ async def _apply_decision(
         if decision_satisfied(draft.status, decision):
             return True, run.status, run.thread_id
         raise DraftConflictError(f"Action draft is already '{draft.status.value}'.")
+
+
+async def _execute_if_approved(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    draft_id: uuid.UUID,
+    decision: DraftDecision,
+) -> DraftExecution | None:
+    """Run the approved-only side effect for an approved draft, at most once.
+
+    Called on every approval request, including replays: the executor itself decides
+    between `executed` and `already_executed`, so a retry after a crash between
+    "decision committed" and "side effect written" heals instead of duplicating.
+    """
+    if decision != "approved":
+        return None
+    executor = DraftExecutor(session_factory=session_factory, settings=settings)
+    try:
+        return await executor.execute(draft_id)
+    except (DraftNotExecutableError, ExecutionDraftNotFoundError):
+        # Draft is not in an executable state (e.g. an earlier execution failed and
+        # marked it `failed`); the committed decision still stands.
+        logger.warning("Approved draft %s is not executable; no side effect written.", draft_id)
+        return None
 
 
 async def _resume_if_paused(
@@ -165,6 +204,14 @@ async def decide_draft(
         decision=decision,
         run_status=run_status,
     )
+    # Side effects run last: the graph resume guard requires the draft to still be
+    # `approved`, and a failed resume must never leave the tracker half-updated.
+    execution = await _execute_if_approved(
+        session_factory=session_factory,
+        settings=settings,
+        draft_id=draft_id,
+        decision=decision,
+    )
 
     async with session_factory() as session:
         stored = await DraftRepo(session).get_by_id(draft_id)
@@ -178,4 +225,5 @@ async def decide_draft(
             already_processed=already_processed,
             run_status=final_status,
             thread_id=thread_id,
+            execution=execution,
         )

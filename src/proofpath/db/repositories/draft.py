@@ -114,6 +114,17 @@ class DraftRepo:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_id_for_update(self, draft_id: uuid.UUID) -> ActionDraft | None:
+        """Fetch an `ActionDraft` by UUID holding a row lock (`SELECT ... FOR UPDATE`).
+
+        Executors take this lock so two concurrent executions of the same approved
+        draft serialize: the loser sees the committed `executed` status and performs
+        no second side effect.
+        """
+        stmt = select(ActionDraft).where(ActionDraft.id == draft_id).with_for_update()
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def get_by_idempotency_key(self, idempotency_key: str) -> ActionDraft | None:
         """Fetch an `ActionDraft` by its unique `idempotency_key`."""
         stmt = select(ActionDraft).where(ActionDraft.idempotency_key == idempotency_key)

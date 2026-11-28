@@ -8,14 +8,17 @@ Runs the real workflow to the approval gate, then drives the HTTP API:
 * repeating an identical decision is idempotent — one `approved_at`, one resume,
   no duplicate side effects — and a contradictory decision is a 409.
 
-Nothing here writes to `application_tracker` or `audit_logs`: approved-only
-executors arrive in Sub-slice 2.1.3.
+Since Sub-slice 2.1.3 the same request also runs the approved-only executor: the
+approval advances `application_tracker` and appends exactly one immutable
+`audit_logs` record carrying the human approval timestamp. Replaying the request
+re-uses that record instead of writing a second side effect.
 """
 
 from __future__ import annotations
 
 import uuid
 from contextlib import suppress
+from datetime import datetime
 from typing import Any
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -29,6 +32,8 @@ from proofpath.config import Settings
 from proofpath.db.models import (
     ActionDraftStatus,
     AnalysisRunStatus,
+    ApplicationStage,
+    AuditActor,
     AuditLog,
     Opportunity,
     RequirementCategory,
@@ -38,6 +43,7 @@ from proofpath.db.models import (
 from proofpath.db.repositories.analysis import AnalysisRepo
 from proofpath.db.repositories.opportunity import OpportunityRepo, RoleRequirementInput
 from proofpath.db.repositories.tracker import TrackerRepo
+from proofpath.execution import APPROVED_EXECUTION_EVENT, ExecutionOutcome
 from proofpath.graph import workflow as workflow_module
 from proofpath.graph.checkpointer import postgres_checkpointer
 from proofpath.graph.dependencies import create_graph_dependencies
@@ -48,6 +54,11 @@ from proofpath.schemas.analysis import ClaimVerdictSchema
 from proofpath.schemas.opportunity import RequirementRecord
 
 pytestmark = pytest.mark.integration
+
+
+def _timestamp(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp from either the API (`...Z`) or the audit row."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _patch_pipeline(monkeypatch: pytest.MonkeyPatch, factory: Any) -> None:
@@ -213,23 +224,32 @@ async def test_approve_is_idempotent_and_finishes_the_run(
         assert body["already_processed"] is False
         assert body["run_status"] == "completed"
         assert body["thread_id"] == run["thread_id"]
-        assert body["draft"]["status"] == "approved"
+        assert body["draft"]["status"] == "executed"
         approved_at = body["draft"]["approved_at"]
         assert approved_at is not None
+        assert body["draft"]["executed_at"] is not None
         assert body["draft"]["idempotency_key"] == (f"proofpath:{run['run_id']}:tracker_upsert")
+        execution = body["execution"]
+        assert execution["outcome"] == ExecutionOutcome.EXECUTED.value
+        assert execution["approved_at"] == approved_at
+        assert execution["audit_log_id"] is not None
+        audit_log_id = execution["audit_log_id"]
 
         again = await client.post(f"/api/v1/drafts/{run['draft_id']}/approve")
         assert again.status_code == 200, again.text
         assert again.json()["already_processed"] is True
         assert again.json()["draft"]["approved_at"] == approved_at
         assert again.json()["run_status"] == "completed"
+        # Replay reports the same side effect; it never writes a second one.
+        assert again.json()["execution"]["outcome"] == ExecutionOutcome.ALREADY_EXECUTED.value
+        assert again.json()["execution"]["audit_log_id"] == audit_log_id
 
         conflict = await client.post(f"/api/v1/drafts/{run['draft_id']}/reject")
         assert conflict.status_code == 409
         assert conflict.headers["content-type"].startswith("application/problem+json")
 
-        approved = await client.get("/api/v1/drafts", params={"status": "approved"})
-        assert [item["id"] for item in approved.json()] == [str(run["draft_id"])]
+        executed = await client.get("/api/v1/drafts", params={"status": "executed"})
+        assert [item["id"] for item in executed.json()] == [str(run["draft_id"])]
 
         missing = await client.post(f"/api/v1/drafts/{uuid.uuid4()}/approve")
         assert missing.status_code == 404
@@ -238,16 +258,32 @@ async def test_approve_is_idempotent_and_finishes_the_run(
         stored = await AnalysisRepo(session).get_run_by_id(run["run_id"], include_drafts=True)
         assert stored is not None
         assert stored.status is AnalysisRunStatus.COMPLETED
-        assert [draft.status for draft in stored.action_drafts] == [ActionDraftStatus.APPROVED]
+        assert [draft.status for draft in stored.action_drafts] == [ActionDraftStatus.EXECUTED]
         assert stored.action_drafts[0].approved_at is not None
-        # Side effects are Sub-slice 2.1.3: nothing was tracked or audited here.
-        assert await TrackerRepo(session).get_by_opportunity_id(run["opportunity_id"]) is None
+        assert stored.action_drafts[0].executed_at is not None
+
+        # Sub-part 2.1.3a: the approval advanced the tracker exactly once.
+        tracker = await TrackerRepo(session).get_by_opportunity_id(run["opportunity_id"])
+        assert tracker is not None
+        assert tracker.stage is ApplicationStage.PREPARING
+
+        # ...and appended exactly one immutable audit record for the draft, even
+        # though approve was requested twice.
         audits = (
-            (await session.execute(select(AuditLog).where(AuditLog.resource_id == run["run_id"])))
+            (await session.execute(select(AuditLog).where(AuditLog.resource_id == run["draft_id"])))
             .scalars()
             .all()
         )
-        assert audits == []
+        assert len(audits) == 1
+        assert audits[0].id == uuid.UUID(audit_log_id)
+        assert audits[0].actor is AuditActor.AGENT
+        assert audits[0].event_type == APPROVED_EXECUTION_EVENT
+        details = audits[0].details_json
+        assert _timestamp(details["approved_at"]) == _timestamp(approved_at)
+        assert details["approved_by"] == "human"
+        assert details["idempotency_key"] == (f"proofpath:{run['run_id']}:tracker_upsert")
+        assert details["target"]["type"] == "application_tracker"
+        assert details["target"]["stage"] == ApplicationStage.PREPARING.value
 
 
 async def test_reject_completes_the_run_without_side_effects(
@@ -266,6 +302,7 @@ async def test_reject_completes_the_run_without_side_effects(
         assert first.json()["draft"]["status"] == "rejected"
         assert first.json()["already_processed"] is False
         assert first.json()["draft"]["approved_at"] is None
+        assert first.json()["execution"] is None
 
         again = await client.post(f"/api/v1/drafts/{run['draft_id']}/reject")
         assert again.status_code == 200
@@ -282,4 +319,11 @@ async def test_reject_completes_the_run_without_side_effects(
         assert stored is not None
         assert stored.status is AnalysisRunStatus.COMPLETED
         assert [draft.status for draft in stored.action_drafts] == [ActionDraftStatus.REJECTED]
+        # Rejections never reach an executor: no tracker write, no audit record.
         assert await TrackerRepo(session).get_by_opportunity_id(run["opportunity_id"]) is None
+        audits = (
+            (await session.execute(select(AuditLog).where(AuditLog.resource_id == run["draft_id"])))
+            .scalars()
+            .all()
+        )
+        assert audits == []

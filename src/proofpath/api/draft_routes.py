@@ -1,8 +1,10 @@
 """Approval API for pending action drafts (Sub-part 2.1.2a).
 
-Every endpoint is side-effect free with respect to the user's data: listing is a
-read, and approving/rejecting only records the decision plus finishes the paused
-run. Tracker and calendar writes stay in the approved-only executors (2.1.3).
+Listing is a read and rejecting never writes user data. Approving records the
+decision, finishes the paused run, and then hands the approved draft to the
+approved-only executors (Sub-slice 2.1.3), which materialize the tracker/calendar
+side effect and the immutable audit record; the response reports that as
+``execution``.
 
 Approving is idempotent (Sub-part 2.1.2b): the same request re-sent after a
 timeout, a retry, or a concurrent duplicate returns ``200`` with
@@ -26,6 +28,7 @@ from proofpath.approvals import (
 )
 from proofpath.db.models import ActionDraftStatus
 from proofpath.db.repositories.draft import DraftDecision, DraftRepo, draft_record
+from proofpath.execution import execution_record
 from proofpath.graph.dependencies import GraphDependenciesError, create_graph_dependencies
 from proofpath.schemas.actions import ActionDraftRecord, DraftDecisionResponse
 
@@ -82,6 +85,7 @@ def _response(result: DraftDecisionResult) -> DraftDecisionResponse:
         already_processed=result.already_processed,
         run_status=result.run_status,
         thread_id=result.thread_id,
+        execution=execution_record(result.execution) if result.execution is not None else None,
     )
 
 

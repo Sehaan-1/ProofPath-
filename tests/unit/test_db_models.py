@@ -308,7 +308,7 @@ def test_analysis_run_verdicts_relationship_and_instantiation() -> None:
 
 
 @pytest.mark.unit
-def test_all_sub_slice_1_1_1_tables_are_registered() -> None:
+def test_all_tables_are_registered() -> None:
     expected_tables = {
         "evidence_sources",
         "evidence_chunks",
@@ -319,6 +319,7 @@ def test_all_sub_slice_1_1_1_tables_are_registered() -> None:
         "application_tracker",
         "action_drafts",
         "audit_logs",
+        "calendar_tasks",
     }
     assert set(Base.metadata.tables.keys()) == expected_tables
 
