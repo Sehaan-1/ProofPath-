@@ -83,6 +83,46 @@ Calendar API (`events.import`); the local task and `.ics` file are always writte
 first and remain the source of truth. With the flag off, ProofPath makes no network
 call at all.
 
+## Background Worker & Redis Job Queue (Slice 2.2.1)
+
+A dedicated `worker` service in `docker-compose.yml` builds the shared proofpath
+image (`Dockerfile`, also reused by the future API service), waits for PostgreSQL
+and Redis to be healthy, and runs `python -m proofpath.workers`. Start everything
+with `make up`, or run the worker against the local containers with `make worker`.
+
+The queue is **Redis Streams** with a consumer group (`proofpath:jobs` /
+`proofpath-workers`), giving at-least-once delivery with a Pending Entries List
+(PEL) that tracks unacked messages. The authoritative, queryable job state lives
+in the `background_jobs` PostgreSQL table — Redis is the transport, Postgres is
+the ledger — correlated by job `id`:
+
+| `status` | meaning |
+|---|---|
+| `queued` | row persisted and a stream message enqueued |
+| `running` | a worker claimed it (`attempt` bumped, `SELECT … FOR UPDATE`) |
+| `succeeded` | terminal success; `result_json` carries the handler result |
+| `failed` | transient failure recorded; the message was re-enqueued for retry |
+| `dead_letter` | retries exhausted (or a permanent error); terminal, kept for replay |
+
+`proofpath.workers.JobQueue` provides the primitives (`enqueue`, `dequeue`,
+`ack`, `reclaim` via `XAUTOCLAIM` for crashed-consumer recovery). The
+`Worker` dequeues a message, loads the row, atomically moves it
+`queued/failed → running` under a row lock (so a duplicate delivery can never
+re-run a finished job), dispatches a registered `TaskHandler` **outside** the DB
+transaction, then finalizes the row and acks the Redis message. A transient
+failure re-enqueues and caps at `max_attempts` before moving to `dead_letter`; a
+permanent error (`transient=False`) or an unknown task type fails straight to
+`dead_letter`. The DB layer is hidden behind a `JobStore` protocol
+(`SqlAlchemyJobStore` is the production implementation) so the orchestration is
+fully unit-tested without a database.
+
+Exponential backoff timing (2s → 8s → 30s) and a dead-letter replay CLI arrive in
+Sub-slice 2.2.3; the real `github_ingest` and `analysis_run` handlers (and the
+`POST …?async=true → 202 + job_id` endpoints) arrive in Sub-slice 2.2.2. Today
+the registry ships two built-in smoke-test tasks — `noop` (succeeds immediately)
+and `echo` (returns its payload) — enough to exercise the full
+queue → worker → ledger loop end to end.
+
 ## Local ProofPath MCP Server (Read-Only & Approval-Gated Tools)
 
 Start the local MCP server over `stdio` (default for IDE / agent clients):

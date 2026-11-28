@@ -14,6 +14,7 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 from proofpath.config import Settings
 from proofpath.db.models import (
     EMBEDDING_DIM,
+    JOB_TERMINAL_STATUSES,
     ActionDraft,
     ActionDraftStatus,
     ActionType,
@@ -23,11 +24,13 @@ from proofpath.db.models import (
     ApplicationTracker,
     AuditActor,
     AuditLog,
+    BackgroundJob,
     Base,
     ClaimVerdict,
     EvidenceChunk,
     EvidenceSource,
     EvidenceSourceType,
+    JobStatus,
     Opportunity,
     RequirementCategory,
     RequirementPriority,
@@ -320,6 +323,7 @@ def test_all_tables_are_registered() -> None:
         "action_drafts",
         "audit_logs",
         "calendar_tasks",
+        "background_jobs",
     }
     assert set(Base.metadata.tables.keys()) == expected_tables
 
@@ -450,3 +454,70 @@ def test_tracker_action_draft_and_audit_log_relationships_and_instantiation() ->
     assert draft.approved_at is None
     assert draft.executed_at is None
     assert audit.actor is AuditActor.AGENT
+
+
+@pytest.mark.unit
+def test_background_job_schema_constraints_and_enums() -> None:
+    assert "background_jobs" in Base.metadata.tables
+    table = Base.metadata.tables["background_jobs"]
+
+    assert set(table.columns.keys()) == {
+        "id",
+        "job_type",
+        "payload_json",
+        "status",
+        "attempt",
+        "max_attempts",
+        "last_error",
+        "error_traceback",
+        "result_json",
+        "started_at",
+        "finished_at",
+        "created_at",
+        "updated_at",
+    }
+    # Nullable diagnostic / lifecycle columns; status defaults to queued.
+    assert table.columns["last_error"].nullable is True
+    assert table.columns["error_traceback"].nullable is True
+    assert table.columns["result_json"].nullable is True
+    assert table.columns["started_at"].nullable is True
+    assert table.columns["finished_at"].nullable is True
+
+    expected_statuses = {"queued", "running", "succeeded", "failed", "dead_letter"}
+    assert {member.value for member in JobStatus} == expected_statuses
+
+    # Terminal statuses drive the worker's duplicate-delivery skip guard.
+    assert frozenset({JobStatus.SUCCEEDED, JobStatus.DEAD_LETTER}) == JOB_TERMINAL_STATUSES
+
+    ddl = _compile_table_ddl("background_jobs")
+    assert "id UUID DEFAULT gen_random_uuid() NOT NULL" in ddl
+    assert "job_type VARCHAR(128)" in ddl
+    assert "payload_json JSONB" in ddl
+    assert "result_json JSONB" in ddl
+    assert "attempt INTEGER DEFAULT 0" in ddl
+    assert "max_attempts INTEGER DEFAULT 3" in ddl
+    assert "created_at TIMESTAMP WITH TIME ZONE" in ddl
+    assert "updated_at TIMESTAMP WITH TIME ZONE" in ddl
+    assert "CONSTRAINT ck_background_jobs_job_status" in ddl
+    assert "CONSTRAINT ck_background_jobs_attempt_non_negative" in ddl
+    assert "CONSTRAINT ck_background_jobs_max_attempts_at_least_one" in ddl
+    for status in expected_statuses:
+        assert f"'{status}'" in ddl
+    assert "CREATE INDEX ix_background_jobs_status ON background_jobs (status)" in ddl
+    assert "CREATE INDEX ix_background_jobs_job_type ON background_jobs (job_type)" in ddl
+    assert (
+        "CREATE INDEX ix_background_jobs_status_created_at ON background_jobs (status, created_at)"
+        in ddl
+    )
+
+    job = BackgroundJob(
+        job_type="github_ingest",
+        payload_json={"repo": "sehaan-1/proofpath"},
+        status=JobStatus.QUEUED,
+        attempt=2,
+        max_attempts=5,
+    )
+    assert job.status is JobStatus.QUEUED
+    assert job.attempt == 2
+    assert job.max_attempts == 5
+    assert job.payload_json == {"repo": "sehaan-1/proofpath"}

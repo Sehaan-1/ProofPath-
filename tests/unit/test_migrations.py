@@ -42,12 +42,14 @@ def test_migration_history_has_single_linear_head() -> None:
     cfg = _make_alembic_config()
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    assert heads == ["0004_calendar_tasks"]
+    assert heads == ["0005_background_jobs"]
     revisions = {rev.revision for rev in script.walk_revisions()}
     assert {
         "0001_initial_schema",
         "0002_add_vector_and_fts_indexes",
         "0003_requirement_entity",
+        "0004_calendar_tasks",
+        "0005_background_jobs",
     }.issubset(revisions)
 
 
@@ -75,6 +77,14 @@ def test_offline_upgrade_emits_all_tables_and_constraints() -> None:
     assert "ck_action_drafts_executed_status_requires_timestamps" in sql
     assert "uq_calendar_tasks_action_draft_id" in sql
     assert "ck_calendar_tasks_end_after_start" in sql
+    # Sub-part 2.2.1b: background job status ledger table and constraints.
+    assert "CREATE TABLE background_jobs (" in sql
+    assert "ck_background_jobs_job_status" in sql
+    assert "ck_background_jobs_attempt_non_negative" in sql
+    assert "ck_background_jobs_max_attempts_at_least_one" in sql
+    assert "CREATE INDEX ix_background_jobs_status" in sql
+    assert "CREATE INDEX ix_background_jobs_job_type" in sql
+    assert "CREATE INDEX ix_background_jobs_status_created_at" in sql
     assert "_ck_" not in sql
 
 

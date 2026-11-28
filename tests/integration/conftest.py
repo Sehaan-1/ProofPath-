@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -103,3 +104,32 @@ async def db_session(db_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
         finally:
             await session.close()
             await outer_tx.rollback()
+
+
+def _resolve_integration_redis_url() -> str:
+    """Resolve the Redis URL for integration tests."""
+    override = os.getenv("TEST_REDIS_URL")
+    if override:
+        return override
+    return str(get_settings().redis_url)
+
+
+@pytest.fixture
+async def redis_client() -> AsyncIterator[Redis]:
+    """Yield a live Redis client, skipping when the service is unavailable."""
+    url = _resolve_integration_redis_url()
+    client = Redis.from_url(url, decode_responses=True)
+    try:
+        await client.ping()
+    except Exception as exc:
+        await client.aclose()
+        if _require_live_db():
+            raise
+        pytest.skip(
+            f"Live Redis service unavailable at {url!r} ({exc}). "
+            "Start local containers with `make up` or set TEST_REDIS_URL."
+        )
+    try:
+        yield client
+    finally:
+        await client.aclose()
