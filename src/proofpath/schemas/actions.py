@@ -8,7 +8,7 @@ from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import AwareDatetime, Field, TypeAdapter, field_validator, model_validator
 
-from proofpath.db.models import ActionDraftStatus, ActionType, ApplicationStage
+from proofpath.db.models import ActionDraftStatus, ActionType, AnalysisRunStatus, ApplicationStage
 from proofpath.schemas.base import StrictModel
 
 _MAX_NOTES = 8000
@@ -154,6 +154,30 @@ class ActionDraftRecord(StrictModel):
     idempotency_key: str = Field(min_length=1, max_length=_MAX_IDEMPOTENCY_KEY)
     approved_at: AwareDatetime | None = None
     executed_at: AwareDatetime | None = None
+
+
+DraftDecision: TypeAlias = Literal["approved", "rejected"]
+
+
+class DraftDecisionResponse(StrictModel):
+    """Result of approving or rejecting one action draft (Sub-slice 2.1.2)."""
+
+    draft: ActionDraftRecord
+    decision: DraftDecision
+    already_processed: bool = Field(
+        description=(
+            "True when an earlier request already applied this decision; the "
+            "draft and its run are returned unchanged instead of being re-executed."
+        ),
+    )
+    run_status: AnalysisRunStatus = Field(
+        description="Analysis run status after the decision, i.e. after the resume.",
+    )
+    thread_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="LangGraph thread the decision was resumed on.",
+    )
 
 
 class TrackerRecord(StrictModel):

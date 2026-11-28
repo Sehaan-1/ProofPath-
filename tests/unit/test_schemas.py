@@ -32,6 +32,7 @@ from proofpath.schemas import (
     ContributionSprintPayload,
     ContributionSprintPlan,
     CreateActionDraftInput,
+    DraftDecisionResponse,
     EvidenceSearchRequest,
     EvidenceSnippet,
     GetActionDraftInput,
@@ -448,6 +449,46 @@ def test_analysis_run_create_request_defaults() -> None:
     request = AnalysisRunCreateRequest.model_validate({"opportunity_id": str(_OPP_ID)})
     assert request.async_run is False
     _assert_extra_forbidden(AnalysisRunCreateRequest, {"opportunity_id": str(_OPP_ID)})
+
+
+@pytest.mark.unit
+def test_draft_decision_response_contract() -> None:
+    payload = {
+        "draft": {
+            "id": str(_DRAFT_ID),
+            "analysis_run_id": str(_RUN_ID),
+            "action_type": "tracker_upsert",
+            "status": "approved",
+            "payload": {
+                "action_type": "tracker_upsert",
+                "opportunity_id": str(_OPP_ID),
+                "stage": "preparing",
+            },
+            "idempotency_key": f"proofpath:{_RUN_ID}:tracker_upsert",
+            "approved_at": "2026-01-01T00:00:00Z",
+        },
+        "decision": "approved",
+        "already_processed": True,
+        "run_status": "completed",
+        "thread_id": "thread-1",
+    }
+    response = DraftDecisionResponse.model_validate(payload)
+    assert response.already_processed is True
+    assert response.run_status is AnalysisRunStatus.COMPLETED
+    assert response.draft.id == _DRAFT_ID
+
+    for decision in ("approved", "rejected"):
+        assert (
+            DraftDecisionResponse.model_validate(payload | {"decision": decision}).decision
+            == decision
+        )
+    with pytest.raises(ValidationError):
+        DraftDecisionResponse.model_validate(payload | {"decision": "maybe"})
+    with pytest.raises(ValidationError):
+        DraftDecisionResponse.model_validate(payload | {"run_status": "pending"})
+    with pytest.raises(ValidationError):
+        DraftDecisionResponse.model_validate(payload | {"thread_id": ""})
+    _assert_extra_forbidden(DraftDecisionResponse, payload)
 
 
 @pytest.mark.unit

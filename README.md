@@ -33,9 +33,17 @@ access-control layer.
   - `POST /api/v1/opportunities` — isolate untrusted job descriptions (`<untrusted_job_description>`) from pasted text or SSRF-hardened public URLs and extract structured `must_have` / `nice_to_have` requirements.
   - `GET /api/v1/opportunities/{opportunity_id}` — read a persisted opportunity and its structured requirements.
   - `POST /api/v1/analyses/run` — execute the durable LangGraph workflow (`planner_router` → `analyse_role` → `retrieve_evidence` → `compare_evidence` → `policy_verifier` → `recommend_contribution_sprint` → `create_action_drafts` → `approval_gate`). Optionally pass timezone-aware `calendar_start` and `calendar_end` to generate a `pending_approval` calendar block draft alongside the tracker draft.
-    The run always stops at the approval gate: LangGraph's `interrupt()` halts it durably in PostgreSQL with `status="awaiting_approval"` and nothing is executed. Resume it on the same `thread_id` with `Command(resume={"decision": "approved" | "rejected", "draft_id": ...})` via `proofpath.graph.resume.resume_approval_run` (approval endpoints arrive in Slice 2.1.2).
+    The run always stops at the approval gate: LangGraph's `interrupt()` halts it durably in PostgreSQL with `status="awaiting_approval"` and nothing is executed. Resume it on the same `thread_id` with `Command(resume={"decision": "approved" | "rejected", "draft_id": ...})` — the approval API below does that for you.
   - `GET /api/v1/analyses/{run_id}` — fetch persisted verdicts, contribution sprint plan, `pending_approval` action drafts, and checkpointed run diagnostics.
   - `GET /api/v1/tracker` — list personal application-tracker entries.
+
+### Approval API (Slice 2.1.2)
+
+- `GET /api/v1/drafts?status=pending_approval` — list action drafts, optionally filtered by `status` and `analysis_run_id` (`limit`/`offset` paginated).
+- `POST /api/v1/drafts/{id}/approve` — approve one pending draft: commits the decision (`approved_at`), then resumes the paused run on its own `thread_id` and reports the resulting `run_status`.
+- `POST /api/v1/drafts/{id}/reject` — reject one pending draft; the run resumes and ends with no side effects.
+
+Decisions are idempotent. Draft status moves through a single compare-and-set from `pending_approval`, so a retried request, a duplicate click, or two concurrent approvals apply the decision exactly once: the extra calls return `200` with `"already_processed": true` and the same `approved_at`. A contradictory decision (approving a rejected draft or vice versa) is `409`, an unknown draft is `404`, and an unconfigured model provider fails closed with `503` before anything is written. Each draft keeps its unique `idempotency_key` (`proofpath:<run_id>:<action_type>`), which the approved-only executors in Slice 2.1.3 dedupe tracker entries and calendar blocks on.
 
 ## Local ProofPath MCP Server (Read-Only Tools)
 

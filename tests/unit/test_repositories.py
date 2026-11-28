@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -29,6 +30,7 @@ from proofpath.db import (
     create_db_engine,
     create_session_factory,
 )
+from proofpath.db.repositories.draft import decided_status, decision_satisfied
 
 
 def _mock_session_with_scalar(scalar_value: Any) -> AsyncMock:
@@ -130,7 +132,7 @@ async def test_analysis_repo_claim_is_a_single_compare_and_set() -> None:
 
 
 @pytest.mark.unit
-async def test_draft_repo_enforces_approval_before_execution() -> None:
+async def test_draft_repo_enforces_atomic_single_winner_decisions() -> None:
     pending_draft = ActionDraft(
         id=uuid.uuid4(),
         analysis_run_id=uuid.uuid4(),
@@ -150,23 +152,74 @@ async def test_draft_repo_enforces_approval_before_execution() -> None:
     with pytest.raises(ValueError, match="expected 'approved'"):
         await repo.mark_failed(pending_draft.id)
 
-    # Approve transitions pending_approval -> approved with UTC timestamp.
-    approved = await repo.approve(pending_draft.id)
-    assert approved is not None
-    assert approved.status is ActionDraftStatus.APPROVED
-    assert approved.approved_at is not None
+    # Approval is one conditional UPDATE ... RETURNING; the winner is unique.
+    assert await repo.approve(pending_draft.id) is pending_draft
+    statement = session.execute.await_args.args[0]
+    compiled = str(statement)
+    assert "UPDATE action_drafts" in compiled
+    assert "action_drafts.status = " in compiled
+    assert "RETURNING action_drafts.id" in compiled
 
-    # Double-approve or reject after approval is rejected.
-    with pytest.raises(ValueError, match="pending_approval"):
-        await repo.approve(pending_draft.id)
-    with pytest.raises(ValueError, match="pending_approval"):
-        await repo.reject(pending_draft.id)
+    with pytest.raises(ValueError, match="decision must be"):
+        await repo.claim_decision(pending_draft.id, decision="approvedd")  # type: ignore[arg-type]
 
-    # Now execution succeeds and stamps executed_at.
-    executed = await repo.mark_executed(pending_draft.id)
+    # Losing the compare-and-set to a concurrent decision fails loudly.
+    stale = MagicMock()
+    stale.scalar_one_or_none.return_value = pending_draft
+    lost = MagicMock()
+    lost.scalar_one_or_none.return_value = None
+    racing = AsyncMock()
+    racing.execute = AsyncMock(side_effect=[stale, lost])
+    racing.flush = AsyncMock()
+    with pytest.raises(ValueError, match="concurrent decision"):
+        await DraftRepo(racing).approve(pending_draft.id)
+    assert (
+        await DraftRepo(_mock_session_with_scalar(None)).claim_decision(
+            pending_draft.id, decision="rejected"
+        )
+        is False
+    )
+
+    # Once the row is approved, execution is allowed; further decisions are not.
+    pending_draft.status = ActionDraftStatus.APPROVED
+    pending_draft.approved_at = datetime.now(UTC)
+    executed = await DraftRepo(session).mark_executed(pending_draft.id)
     assert executed is not None
     assert executed.status is ActionDraftStatus.EXECUTED
     assert executed.executed_at is not None
+
+    decided = _mock_session_with_scalar(
+        ActionDraft(
+            id=pending_draft.id,
+            analysis_run_id=pending_draft.analysis_run_id,
+            action_type=pending_draft.action_type,
+            payload_json={},
+            status=ActionDraftStatus.APPROVED,
+            idempotency_key="run-1:tracker_upsert",
+            approved_at=datetime.now(UTC),
+            executed_at=None,
+        )
+    )
+    with pytest.raises(ValueError, match="expected 'pending_approval'"):
+        await DraftRepo(decided).approve(pending_draft.id)
+    with pytest.raises(ValueError, match="expected 'pending_approval'"):
+        await DraftRepo(decided).reject(pending_draft.id)
+
+
+@pytest.mark.unit
+def test_draft_decision_helpers_map_human_decisions() -> None:
+    assert decided_status("approved") is ActionDraftStatus.APPROVED
+    assert decided_status("rejected") is ActionDraftStatus.REJECTED
+    for status in (
+        ActionDraftStatus.APPROVED,
+        ActionDraftStatus.EXECUTED,
+        ActionDraftStatus.FAILED,
+    ):
+        assert decision_satisfied(status, "approved") is True
+        assert decision_satisfied(status, "rejected") is False
+    assert decision_satisfied(ActionDraftStatus.REJECTED, "rejected") is True
+    assert decision_satisfied(ActionDraftStatus.PENDING_APPROVAL, "rejected") is False
+    assert decision_satisfied(ActionDraftStatus.REJECTED, "approved") is False
 
 
 @pytest.mark.unit

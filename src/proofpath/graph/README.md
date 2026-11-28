@@ -57,6 +57,11 @@ fallback error node. The gate only records an `ApprovalDecision` in state;
 committing approvals to `action_drafts` (Slice 2.1.2) and approved-only side
 effects (Slice 2.1.3) happen outside the graph.
 
+`proofpath.approvals.decide_draft` (exposed as `POST /api/v1/drafts/{id}/approve|reject`)
+commits the decision with one compare-and-set on the draft row and then resumes
+the run; a repeated request returns `already_processed` without re-deciding, so an
+approval can never be applied twice.
+
 `proofpath.graph.resume.resume_approval_run` is the service layer for that flow:
 it resolves the run from the thread, requires `awaiting_approval` and a real gate
 pause, atomically claims the run out of `awaiting_approval` (so only one resume

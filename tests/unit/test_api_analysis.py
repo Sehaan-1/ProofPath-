@@ -106,9 +106,13 @@ def app_services(monkeypatch):
             ]
 
     monkeypatch.setattr(analysis_routes, "AnalysisRepo", Repo)
-    monkeypatch.setattr(analysis_routes, "create_role_parser", lambda _settings: object())
-    monkeypatch.setattr(analysis_routes, "create_embedding_client", lambda _settings: object())
-    monkeypatch.setattr(analysis_routes, "create_graph_backend", lambda _settings: object())
+
+    class FakeDependencies:
+        parser = embedder = comparator = sprint_planner = object()
+
+    monkeypatch.setattr(
+        analysis_routes, "create_graph_dependencies", lambda _settings: FakeDependencies()
+    )
     approval_interrupt = Interrupt(
         value=ApprovalRequest(
             analysis_run_id=uuid4(),

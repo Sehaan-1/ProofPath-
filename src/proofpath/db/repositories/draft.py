@@ -4,12 +4,58 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from proofpath.db.models import ActionDraft, ActionDraftStatus, ActionType
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from proofpath.schemas.actions import ActionDraftRecord
+
+DraftDecision: TypeAlias = Literal["approved", "rejected"]
+
+
+def draft_record(draft: ActionDraft) -> ActionDraftRecord:
+    """Map a persisted draft row to its API/state/graph contract.
+
+    Imported lazily: `proofpath.schemas.actions` reads `proofpath.db.models`, which
+    initializes the `proofpath.db` package and therefore this module.
+    """
+    from proofpath.schemas.actions import (
+        ActionDraftRecord,
+        parse_action_draft_payload,
+    )
+
+    return ActionDraftRecord(
+        id=draft.id,
+        analysis_run_id=draft.analysis_run_id,
+        action_type=draft.action_type,
+        status=draft.status,
+        payload=parse_action_draft_payload(draft.payload_json),
+        idempotency_key=draft.idempotency_key,
+        approved_at=draft.approved_at,
+        executed_at=draft.executed_at,
+    )
+
+
+def decided_status(decision: DraftDecision) -> ActionDraftStatus:
+    """Map a human decision to the draft status it produces."""
+    return ActionDraftStatus.APPROVED if decision == "approved" else ActionDraftStatus.REJECTED
+
+
+def decision_satisfied(status: ActionDraftStatus, decision: DraftDecision) -> bool:
+    """Return True when `status` already reflects `decision` (idempotent retry)."""
+    if decision == "approved":
+        # `failed` means approved by a human whose executor then failed; the
+        # decision itself is still approved.
+        return status in {
+            ActionDraftStatus.APPROVED,
+            ActionDraftStatus.EXECUTED,
+            ActionDraftStatus.FAILED,
+        }
+    return status is ActionDraftStatus.REJECTED
 
 
 class DraftRepo:
@@ -82,15 +128,52 @@ class DraftRepo:
         limit: int = 100,
         offset: int = 0,
     ) -> list[ActionDraft]:
-        """List action drafts optionally filtered by status and/or analysis run."""
+        """List action drafts, filtered by status and/or run, in a stable order.
+
+        Ordering is deterministic so paging never repeats or skips a draft.
+        """
         stmt = select(ActionDraft)
         if status is not None:
             stmt = stmt.where(ActionDraft.status == status)
         if analysis_run_id is not None:
             stmt = stmt.where(ActionDraft.analysis_run_id == analysis_run_id)
-        stmt = stmt.limit(limit).offset(offset)
+        stmt = (
+            stmt.order_by(ActionDraft.analysis_run_id, ActionDraft.action_type, ActionDraft.id)
+            .limit(limit)
+            .offset(offset)
+        )
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def claim_decision(
+        self,
+        draft_id: uuid.UUID,
+        *,
+        decision: DraftDecision,
+        decided_at: datetime | None = None,
+    ) -> bool:
+        """Atomically move `pending_approval` to the decided state; single winner.
+
+        Compare-and-set on `status`: exactly one caller (across processes) can
+        consume a pending draft, so a repeated or concurrent approval can never
+        trigger the same side effect twice. Returns False when the draft was not
+        pending (already decided, executed, failed, or missing).
+        """
+        if decision not in ("approved", "rejected"):
+            raise ValueError("decision must be 'approved' or 'rejected'.")
+        values: dict[str, Any] = {"status": decided_status(decision)}
+        if decision == "approved":
+            values["approved_at"] = decided_at or datetime.now(UTC)
+        result = await self._session.execute(
+            update(ActionDraft)
+            .where(
+                ActionDraft.id == draft_id,
+                ActionDraft.status == ActionDraftStatus.PENDING_APPROVAL,
+            )
+            .values(**values)
+            .returning(ActionDraft.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def approve(
         self,
@@ -107,8 +190,10 @@ class DraftRepo:
                 f"Cannot approve draft in status '{draft.status.value}'; "
                 "expected 'pending_approval'."
             )
-        draft.status = ActionDraftStatus.APPROVED
-        draft.approved_at = approved_at or datetime.now(UTC)
+        if not await self.claim_decision(draft_id, decision="approved", decided_at=approved_at):
+            raise ValueError(
+                "Cannot approve draft; it is no longer 'pending_approval' (concurrent decision)."
+            )
         await self._session.flush()
         return draft
 
@@ -122,7 +207,10 @@ class DraftRepo:
                 f"Cannot reject draft in status '{draft.status.value}'; "
                 "expected 'pending_approval'."
             )
-        draft.status = ActionDraftStatus.REJECTED
+        if not await self.claim_decision(draft_id, decision="rejected"):
+            raise ValueError(
+                "Cannot reject draft; it is no longer 'pending_approval' (concurrent decision)."
+            )
         await self._session.flush()
         return draft
 

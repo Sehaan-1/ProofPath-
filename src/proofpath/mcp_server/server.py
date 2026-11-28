@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.applications import Starlette
 
 from proofpath.config import LogLevel, Settings, get_settings
-from proofpath.db.repositories.draft import DraftRepo
+from proofpath.db.repositories.draft import DraftRepo, draft_record
 from proofpath.db.repositories.opportunity import OpportunityRepo
 from proofpath.db.repositories.tracker import TrackerRepo
 from proofpath.db.session import DatabaseSessionManager
@@ -43,7 +43,6 @@ from proofpath.retrieval.hybrid_search import DEFAULT_TOP_K, HybridSearcher
 from proofpath.schemas.actions import (
     ActionDraftRecord,
     ApplicationStatusResponse,
-    parse_action_draft_payload,
 )
 from proofpath.schemas.evidence import EvidenceSearchResponse
 from proofpath.schemas.opportunity import OpportunityResponse, RequirementRecord
@@ -239,21 +238,11 @@ async def _execute_get_action_draft(
     if draft is None:
         raise ToolError(f"Action draft {validated.draft_id} not found.")
     try:
-        payload = parse_action_draft_payload(draft.payload_json)
+        return draft_record(draft)
     except ValidationError as exc:
         raise ToolError(
             f"Stored payload for action draft {validated.draft_id} is invalid."
         ) from exc
-    return ActionDraftRecord(
-        id=draft.id,
-        analysis_run_id=draft.analysis_run_id,
-        action_type=draft.action_type,
-        status=draft.status,
-        payload=payload,
-        idempotency_key=draft.idempotency_key,
-        approved_at=draft.approved_at,
-        executed_at=draft.executed_at,
-    )
 
 
 def create_mcp_server(
