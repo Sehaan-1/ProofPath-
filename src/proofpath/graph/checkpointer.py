@@ -34,6 +34,12 @@ _STATE_TYPES = (
     ("proofpath.schemas.actions", "CalendarBlockPayload"),
     ("proofpath.schemas.actions", "ContributionSprintPayload"),
     ("proofpath.graph.state", "PolicyViolation"),
+    # Asyncpg returns UUID columns as `pgproto.UUID`; without this entry those
+    # checkpointed identifiers are silently restored as bare hex strings.
+    ("asyncpg.pgproto.pgproto", "UUID"),
+    ("proofpath.graph.state", "ApprovalRequest"),
+    ("proofpath.graph.state", "ApprovalDraftSummary"),
+    ("proofpath.graph.state", "ApprovalDecision"),
     ("proofpath.policy.ledger_validator", "DowngradeReason"),
     ("proofpath.db.models", "RequirementCategory"),
     ("proofpath.db.models", "RequirementPriority"),

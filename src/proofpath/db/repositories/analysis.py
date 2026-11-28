@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -136,6 +136,26 @@ class AnalysisRepo:
             run.trace_id = trace_id
         await self._session.flush()
         return run
+
+    async def claim_awaiting_approval(self, run_id: uuid.UUID) -> bool:
+        """Atomically consume a paused run so only one approval resume proceeds.
+
+        Compare-and-set on ``status``: returns True exactly once for a run in
+        ``awaiting_approval``; every other caller (including a retry after the
+        pause was consumed) gets False.
+        """
+        stmt = (
+            update(AnalysisRun)
+            .where(
+                AnalysisRun.id == run_id,
+                AnalysisRun.status == AnalysisRunStatus.AWAITING_APPROVAL,
+            )
+            .values(status=AnalysisRunStatus.RUNNING)
+            .returning(AnalysisRun.id)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none() is not None
 
     async def delete_run(self, run_id: uuid.UUID) -> bool:
         """Delete an `AnalysisRun` (cascades to claim verdicts and action drafts)."""

@@ -15,6 +15,7 @@ from proofpath.config import LLMProvider
 from proofpath.db.models import AnalysisRunStatus
 from proofpath.db.repositories.analysis import AnalysisRepo, ClaimVerdictInput
 from proofpath.db.repositories.opportunity import OpportunityRepo
+from proofpath.graph.approval import approval_request_from_interrupts
 from proofpath.graph.backends import create_graph_backend
 from proofpath.graph.checkpointer import thread_config
 from proofpath.graph.state import initial_state
@@ -71,15 +72,17 @@ async def run_analysis(payload: AnalysisRunCreateRequest, request: Request) -> A
         )
         errors = state.get("errors", [])
         verified = state.get("policy_verified", False)
-        status = (
-            AnalysisRunStatus.FAILED
-            if errors or not verified
-            else (
-                AnalysisRunStatus.AWAITING_APPROVAL
-                if state.get("draft_actions")
-                else AnalysisRunStatus.COMPLETED
-            )
+        interrupts = state.get("__interrupt__") or ()
+        paused_for_approval = approval_request_from_interrupts(interrupts) is not None and bool(
+            state.get("draft_actions")
         )
+        if errors or not verified or (interrupts and not paused_for_approval):
+            # A pause anywhere other than the approval gate is not approvable.
+            status = AnalysisRunStatus.FAILED
+        elif paused_for_approval:
+            status = AnalysisRunStatus.AWAITING_APPROVAL
+        else:
+            status = AnalysisRunStatus.COMPLETED
         async with factory.begin() as session:
             repo = AnalysisRepo(session)
             if verified:

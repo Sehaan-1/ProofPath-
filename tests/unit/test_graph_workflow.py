@@ -8,9 +8,11 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from proofpath.config import Settings
+from proofpath.db.models import ActionDraftStatus, ActionType, ApplicationStage
 from proofpath.graph import workflow
 from proofpath.graph.checkpointer import thread_config
 from proofpath.graph.state import initial_state
+from proofpath.schemas.actions import ActionDraftRecord, TrackerUpsertPayload
 
 pytestmark = pytest.mark.unit
 
@@ -55,9 +57,27 @@ async def test_graph_routes_retry_and_requires_thread(monkeypatch):
         calls.append("sprint")
         return {"step_count": state["step_count"] + 1}
 
+    draft_id = uuid4()
+
     async def drafts(state, **kwargs):
         calls.append("drafts")
-        return {"step_count": state["step_count"] + 1}
+        return {
+            "draft_actions": [
+                ActionDraftRecord(
+                    id=draft_id,
+                    analysis_run_id=run_id,
+                    action_type=ActionType.TRACKER_UPSERT,
+                    status=ActionDraftStatus.PENDING_APPROVAL,
+                    payload=TrackerUpsertPayload(
+                        action_type=ActionType.TRACKER_UPSERT,
+                        opportunity_id=opp,
+                        stage=ApplicationStage.PREPARING,
+                    ),
+                    idempotency_key=f"proofpath:{run_id}:tracker_upsert",
+                )
+            ],
+            "step_count": state["step_count"] + 1,
+        }
 
     for name, fn in [
         ("planner_router", planner),
@@ -99,6 +119,23 @@ async def test_graph_routes_retry_and_requires_thread(monkeypatch):
         "drafts",
     ]
     assert output["step_count"] == 9
+
+    # Sub-part 2.1.1a: the run halts at the approval gate, not at END.
+    assert output["__interrupt__"]
+    pending = await graph.apending_approval()
+    assert pending is not None
+    assert pending.draft_ids == {draft_id}
+
+    # Sub-part 2.1.1b: resume on the same thread records the human decision and
+    # re-executes no upstream node.
+    resumed = await graph.aresume(
+        {"decision": "approved", "draft_id": str(draft_id)}, thread_config(thread)
+    )
+    assert resumed["approval_decision"].decision == "approved"
+    assert resumed["step_count"] == 10
+    assert not resumed.get("__interrupt__")
+    assert calls[-1] == "drafts"
+    assert len(calls) == 9
 
 
 def _failure_graph(monkeypatch, *, step_budget=50, audit_error=None):

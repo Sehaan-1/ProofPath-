@@ -10,11 +10,12 @@ Use `initial_state` for a fresh run, not for a resume.
 from __future__ import annotations
 
 import uuid
-from typing import NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from pydantic import Field
 
 from proofpath.config import Settings, get_settings
+from proofpath.db.models import ActionType
 from proofpath.policy.ledger_validator import DowngradeReason
 from proofpath.schemas.actions import ActionDraftRecord, ContributionSprintPlan
 from proofpath.schemas.analysis import ClaimVerdictSchema
@@ -42,6 +43,46 @@ class GraphError(TypedDict):
     retryable: bool
 
 
+class ApprovalDraftSummary(StrictModel):
+    """PII-free description of one draft presented to the human reviewer.
+
+    Only identifiers and human-readable summaries enter the interrupt payload:
+    draft payloads can contain personal notes and are deliberately not copied into
+    the checkpointed approval request.
+    """
+
+    draft_id: uuid.UUID
+    action_type: ActionType
+    summary: str = Field(min_length=1, max_length=280)
+
+
+class ApprovalRequest(StrictModel):
+    """Deterministic payload surfaced by the `approval_gate_node` interrupt.
+
+    The payload is rebuilt from checkpointed state on replay, so it must never
+    depend on the wall clock, randomness, or external I/O.
+    """
+
+    analysis_run_id: uuid.UUID
+    drafts: list[ApprovalDraftSummary] = Field(min_length=1, max_length=20)
+
+    @property
+    def draft_ids(self) -> set[uuid.UUID]:
+        """Identifiers a resume value is allowed to target."""
+        return {draft.draft_id for draft in self.drafts}
+
+
+class ApprovalDecision(StrictModel):
+    """Validated human decision supplied through `Command(resume=...)`.
+
+    Mirrors the documented resume contract exactly:
+    ``{"decision": "approved" | "rejected", "draft_id": "<draft uuid>"}``.
+    """
+
+    decision: Literal["approved", "rejected"]
+    draft_id: uuid.UUID
+
+
 class ProofPathState(TypedDict):
     """Analysis state. Keys other than the opportunity may be absent in partial updates."""
 
@@ -54,6 +95,8 @@ class ProofPathState(TypedDict):
     policy_verified: NotRequired[bool]
     contribution_sprint: NotRequired[ContributionSprintPlan | None]
     draft_actions: NotRequired[list[ActionDraftRecord]]
+    approval_request: NotRequired[ApprovalRequest | None]
+    approval_decision: NotRequired[ApprovalDecision | None]
     tracker_stage: NotRequired[str | None]
     step_budget: NotRequired[int]
     step_count: NotRequired[int]
@@ -76,6 +119,8 @@ def initial_state(opportunity_id: uuid.UUID, *, settings: Settings | None = None
         "policy_verified": False,
         "contribution_sprint": None,
         "draft_actions": [],
+        "approval_request": None,
+        "approval_decision": None,
         "step_count": 0,
         "retry_count": 0,
         "max_retries": active_settings.max_agent_retries,

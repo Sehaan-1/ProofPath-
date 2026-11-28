@@ -32,7 +32,8 @@ access-control layer.
 - **Opportunities, Bounded LangGraph Analysis & Tracker**
   - `POST /api/v1/opportunities` — isolate untrusted job descriptions (`<untrusted_job_description>`) from pasted text or SSRF-hardened public URLs and extract structured `must_have` / `nice_to_have` requirements.
   - `GET /api/v1/opportunities/{opportunity_id}` — read a persisted opportunity and its structured requirements.
-  - `POST /api/v1/analyses/run` — execute the durable LangGraph workflow (`planner_router` → `analyse_role` → `retrieve_evidence` → `compare_evidence` → `policy_verifier` → `recommend_contribution_sprint` → `create_action_drafts`). Optionally pass timezone-aware `calendar_start` and `calendar_end` to generate a `pending_approval` calendar block draft alongside the tracker draft.
+  - `POST /api/v1/analyses/run` — execute the durable LangGraph workflow (`planner_router` → `analyse_role` → `retrieve_evidence` → `compare_evidence` → `policy_verifier` → `recommend_contribution_sprint` → `create_action_drafts` → `approval_gate`). Optionally pass timezone-aware `calendar_start` and `calendar_end` to generate a `pending_approval` calendar block draft alongside the tracker draft.
+    The run always stops at the approval gate: LangGraph's `interrupt()` halts it durably in PostgreSQL with `status="awaiting_approval"` and nothing is executed. Resume it on the same `thread_id` with `Command(resume={"decision": "approved" | "rejected", "draft_id": ...})` via `proofpath.graph.resume.resume_approval_run` (approval endpoints arrive in Slice 2.1.2).
   - `GET /api/v1/analyses/{run_id}` — fetch persisted verdicts, contribution sprint plan, `pending_approval` action drafts, and checkpointed run diagnostics.
   - `GET /api/v1/tracker` — list personal application-tracker entries.
 

@@ -112,6 +112,24 @@ async def test_analysis_repo_enforces_citation_and_non_negative_metrics() -> Non
 
 
 @pytest.mark.unit
+async def test_analysis_repo_claim_is_a_single_compare_and_set() -> None:
+    run_id = uuid.uuid4()
+
+    claimed_session = _mock_session_with_scalar(run_id)
+    assert await AnalysisRepo(claimed_session).claim_awaiting_approval(run_id) is True
+    statement = claimed_session.execute.await_args.args[0]
+    compiled = str(statement)
+    assert "UPDATE analysis_runs" in compiled
+    assert "analysis_runs.status = " in compiled
+    assert "RETURNING analysis_runs.id" in compiled
+    assert statement._execution_options["synchronize_session"] is False
+
+    # A run that already left `awaiting_approval` returns no row: no second resume.
+    lost_session = _mock_session_with_scalar(None)
+    assert await AnalysisRepo(lost_session).claim_awaiting_approval(run_id) is False
+
+
+@pytest.mark.unit
 async def test_draft_repo_enforces_approval_before_execution() -> None:
     pending_draft = ActionDraft(
         id=uuid.uuid4(),
