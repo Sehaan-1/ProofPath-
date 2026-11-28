@@ -41,7 +41,7 @@ from proofpath.graph.dependencies import (
     create_graph_dependencies,
 )
 from proofpath.graph.state import initial_state
-from proofpath.graph.workflow import build_workflow
+from proofpath.graph.workflow import BoundedWorkflow, build_workflow
 from proofpath.ingestion.github_ingester import (
     GitHubEvidenceClient,
     GitHubIngestError,
@@ -50,6 +50,7 @@ from proofpath.ingestion.github_ingester import (
 )
 from proofpath.ingestion.markdown_ingester import persist_parsed_document
 from proofpath.ingestion.resume_parser import ParsedDocument
+from proofpath.observability.usage import estimate_cost_usd, total_tokens
 from proofpath.retrieval.embeddings import create_embedding_client
 from proofpath.schemas.base import StrictModel
 from proofpath.workers.queue import JobQueue
@@ -175,8 +176,14 @@ async def execute_analysis_graph(
     before any run row is created. On an unhandled exception the run is marked
     ``failed`` and the exception re-raises (the API maps that to 503; the handler
     treats a recorded failure as job success to avoid duplicate runs on retry).
+
+    Sub-part 2.4.2b: the run's accumulated ``llm_usage`` is summed into
+    ``total_tokens`` and an ``estimated_cost_usd``, and persisted alongside
+    ``latency_ms`` and the unified ``trace_id`` so metrics are queryable via the
+    API even outside the trace UI. The trace id is recorded even on failure.
     """
     started = time.monotonic()
+    graph: BoundedWorkflow | None = None
     try:
         graph = build_workflow(
             checkpointer=checkpointer,
@@ -206,10 +213,16 @@ async def execute_analysis_graph(
             status = AnalysisRunStatus.AWAITING_APPROVAL
         else:
             status = AnalysisRunStatus.COMPLETED
+        usage = state.get("llm_usage", [])
         async with session_factory.begin() as session:
             repo = AnalysisRepo(session)
             await repo.update_run_metrics(
-                run_id, status=status, latency_ms=int((time.monotonic() - started) * 1000)
+                run_id,
+                status=status,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                total_tokens=total_tokens(usage),
+                estimated_cost_usd=estimate_cost_usd(usage),
+                trace_id=graph.trace_id,
             )
         return status
     except asyncio.CancelledError:
@@ -218,6 +231,7 @@ async def execute_analysis_graph(
                 run_id,
                 status=AnalysisRunStatus.FAILED,
                 latency_ms=int((time.monotonic() - started) * 1000),
+                trace_id=graph.trace_id if graph is not None else None,
             )
         raise
     except Exception:
@@ -226,6 +240,7 @@ async def execute_analysis_graph(
                 run_id,
                 status=AnalysisRunStatus.FAILED,
                 latency_ms=int((time.monotonic() - started) * 1000),
+                trace_id=graph.trace_id if graph is not None else None,
             )
         raise
 

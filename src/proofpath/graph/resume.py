@@ -97,11 +97,12 @@ async def _set_status(
     status: AnalysisRunStatus,
     *,
     invalidate_drafts: Collection[UUID] = (),
+    trace_id: str | None = None,
 ) -> None:
     async with session_factory.begin() as session:
         if invalidate_drafts:
             await DraftRepo(session).invalidate_gate_drafts(run_id, invalidate_drafts)
-        await AnalysisRepo(session).update_run_metrics(run_id, status=status)
+        await AnalysisRepo(session).update_run_metrics(run_id, status=status, trace_id=trace_id)
 
 
 async def resume_approval_run(
@@ -163,10 +164,14 @@ async def resume_approval_run(
     try:
         state = await workflow.aresume(resume_value(parsed), workflow_config(thread_id))
     except asyncio.CancelledError:
-        await _set_status(session_factory, run.id, AnalysisRunStatus.FAILED)
+        await _set_status(
+            session_factory, run.id, AnalysisRunStatus.FAILED, trace_id=workflow.trace_id
+        )
         raise
     except Exception as exc:  # process-level failures are not node failures
-        await _set_status(session_factory, run.id, AnalysisRunStatus.FAILED)
+        await _set_status(
+            session_factory, run.id, AnalysisRunStatus.FAILED, trace_id=workflow.trace_id
+        )
         raise ApprovalError("Approval resume could not be completed.") from exc
 
     errors = list(state.get("errors") or ())
@@ -179,16 +184,24 @@ async def resume_approval_run(
             else ApprovalDecision.model_validate(recorded)
         )
     if recorded is None and not errors and not interrupted:
-        await _set_status(session_factory, run.id, AnalysisRunStatus.FAILED)
+        await _set_status(
+            session_factory, run.id, AnalysisRunStatus.FAILED, trace_id=workflow.trace_id
+        )
         raise ApprovalError("Approval gate resumed without recording a decision.")
     if recorded is not None and recorded != parsed:
-        await _set_status(session_factory, run.id, AnalysisRunStatus.FAILED)
+        await _set_status(
+            session_factory, run.id, AnalysisRunStatus.FAILED, trace_id=workflow.trace_id
+        )
         raise ApprovalError("Approval gate recorded a decision that was not requested.")
 
     status = AnalysisRunStatus.FAILED if errors or interrupted else AnalysisRunStatus.COMPLETED
     rejected = any(error["code"] == OUTPUT_CONTRACT_REJECTED for error in errors)
     await _set_status(
-        session_factory, run.id, status, invalidate_drafts=paused.draft_ids if rejected else ()
+        session_factory,
+        run.id,
+        status,
+        invalidate_drafts=paused.draft_ids if rejected else (),
+        trace_id=workflow.trace_id,
     )
     return ApprovalResumeResult(
         analysis_run_id=run.id,

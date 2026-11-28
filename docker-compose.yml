@@ -47,6 +47,7 @@ services:
       dockerfile: Dockerfile
       args:
         ENABLE_GUARDRAILS: ${ENABLE_GUARDRAILS:-false}
+        OBSERVABILITY_BACKEND: ${OBSERVABILITY_BACKEND:-none}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -68,6 +69,10 @@ services:
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       OBSERVABILITY_BACKEND: ${OBSERVABILITY_BACKEND:-none}
+      # Langfuse tracing (Sub-slice 2.4.1); only used when OBSERVABILITY_BACKEND=langfuse.
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
       ENABLE_GUARDRAILS: ${ENABLE_GUARDRAILS:-false}
       REDACT_PII: ${REDACT_PII:-false}
     command: ["python", "-m", "proofpath.workers"]

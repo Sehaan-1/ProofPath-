@@ -14,6 +14,7 @@ from pydantic_core import to_jsonable_python
 
 from proofpath.config import LLMProvider, Settings
 from proofpath.graph.state import PolicyViolation
+from proofpath.observability.usage import record_response_usage
 from proofpath.policy.injection_guard import mask_pii, neutralize_jd_instructions
 from proofpath.policy.tool_trace import reject_model_tool_calls
 from proofpath.schemas.actions import ContributionSprintPlan
@@ -90,6 +91,7 @@ class OpenAIGraphBackend:
             response_format=ClaimVerdictSchema,
             temperature=0,
         )
+        record_response_usage(self.model, response)
         message = response.choices[0].message
         reject_model_tool_calls(message)
         if message.refusal or message.parsed is None:
@@ -120,6 +122,7 @@ class OpenAIGraphBackend:
             response_format=ContributionSprintPlan,
             temperature=0,
         )
+        record_response_usage(self.model, response)
         message = response.choices[0].message
         reject_model_tool_calls(message)
         if message.refusal or message.parsed is None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,6 +22,7 @@ from proofpath.jobs import (
     enqueue_job,
     execute_analysis_graph,
 )
+from proofpath.observability.usage import LLMUsage
 from proofpath.workers.tasks import JobContext
 
 pytestmark = pytest.mark.unit
@@ -175,18 +177,32 @@ async def test_execute_analysis_graph_requires_final_contract_not_only_policy(
     run_id = uuid.uuid4()
     opp_id = uuid.uuid4()
     runs = {run_id: SimpleNamespace(status=AnalysisRunStatus.RUNNING)}
+    usage = [LLMUsage(model="gpt-4o-mini", prompt_tokens=1000, completion_tokens=500)]
 
     class Repo:
         # Verdicts now commit in the graph's validated draft transaction.
-        async def update_run_metrics(self, _run_id, *, status, latency_ms):
+        async def update_run_metrics(
+            self,
+            _run_id,
+            *,
+            status,
+            latency_ms,
+            total_tokens=None,
+            estimated_cost_usd=None,
+            trace_id=None,
+        ):
             runs[_run_id].status = status
             runs[_run_id].latency_ms = latency_ms
+            runs[_run_id].total_tokens = total_tokens
+            runs[_run_id].estimated_cost_usd = estimated_cost_usd
+            runs[_run_id].trace_id = trace_id
 
     monkeypatch.setattr(jobs, "AnalysisRepo", lambda _session: Repo())
     monkeypatch.setattr(
         jobs,
         "build_workflow",
         lambda **_kw: SimpleNamespace(
+            trace_id="unified-trace-id",
             ainvoke=AsyncMock(
                 return_value={
                     "policy_verified": True,
@@ -194,8 +210,9 @@ async def test_execute_analysis_graph_requires_final_contract_not_only_policy(
                     "draft_actions": [],
                     "__interrupt__": (),
                     "output_validated": validated,
+                    "llm_usage": usage,
                 }
-            )
+            ),
         ),
     )
 
@@ -211,6 +228,10 @@ async def test_execute_analysis_graph_requires_final_contract_not_only_policy(
     )
     assert status is expected
     assert runs[run_id].status is expected
+    # Sub-part 2.4.2b: tokens, estimated cost and the unified trace id persist.
+    assert runs[run_id].total_tokens == 1500
+    assert runs[run_id].estimated_cost_usd == Decimal("0.000450")
+    assert runs[run_id].trace_id == "unified-trace-id"
 
 
 async def test_execute_analysis_graph_marks_failed_on_exception(monkeypatch) -> None:
@@ -221,14 +242,18 @@ async def test_execute_analysis_graph_marks_failed_on_exception(monkeypatch) -> 
         async def upsert_verdicts(self, *_a, **_kw):
             pass
 
-        async def update_run_metrics(self, _run_id, *, status, latency_ms):
+        async def update_run_metrics(self, _run_id, *, status, latency_ms, trace_id=None):
             state["status"] = status
+            state["trace_id"] = trace_id
 
     monkeypatch.setattr(jobs, "AnalysisRepo", lambda _session: Repo())
     monkeypatch.setattr(
         jobs,
         "build_workflow",
-        lambda **_kw: SimpleNamespace(ainvoke=AsyncMock(side_effect=RuntimeError("boom"))),
+        lambda **_kw: SimpleNamespace(
+            trace_id="unified-trace-id",
+            ainvoke=AsyncMock(side_effect=RuntimeError("boom")),
+        ),
     )
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -242,6 +267,8 @@ async def test_execute_analysis_graph_marks_failed_on_exception(monkeypatch) -> 
             thread_id="t-1",
         )
     assert state["status"] is AnalysisRunStatus.FAILED
+    # The trace id is recorded even when the run fails, for correlation.
+    assert state["trace_id"] == "unified-trace-id"
 
 
 # ---------------------------------------------------------------------------

@@ -217,6 +217,62 @@ Guardrails AI on citation IDs and tool names only; it does not call an LLM or
 repair rejected output. Installing the extra alone does not enable it, and
 enabling it without the extra fails closed.
 
+## Observability, Tracing & Cost Metrics (Slice 2.4)
+
+ProofPath wires **one** observability backend in the MVP: **Langfuse** (fast
+trace UI plus prompt/cost correlation). OpenLLMetry is deliberately not wired —
+`OBSERVABILITY_BACKEND=openllmetry` fails closed with a configuration error
+rather than running a second backend. The default is `none`: no callbacks, no
+I/O, and no tracing dependencies imported.
+
+Enable Langfuse for the API and worker:
+
+```sh
+pip install -e '.[observability]'
+# in .env (both API and worker processes):
+OBSERVABILITY_BACKEND=langfuse
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com   # or your self-hosted instance
+```
+
+For the Compose worker, set the same variables in `.env` and rebuild with
+`docker compose up -d --build worker` (the build arg installs the isolated
+extra). The SDK and `langchain` live only in the `observability` extra, so
+OpenTelemetry never touches the core runtime; selecting `langfuse` without the
+extra or without both keys fails closed before a run starts.
+
+Every analysis run emits **one unified trace ID**, derived deterministically
+from the run id (`sha256(str(run_id))[:16].hex()`, compatible with
+`Langfuse.create_trace_id(seed=...)`). `build_workflow` attaches the backend's
+LangGraph callback handler at the single `BoundedWorkflow` choke point, so the
+synchronous API, the async worker, and MCP approval resumes all trace without
+caller-side wiring. The initial invocation and every later approval resume —
+even from a different process after the human pause — join the *same* trace,
+named `analysis_run`, with the LangGraph `thread_id` as the Langfuse session and
+the run/thread ids as span metadata. Spans are flushed after each invocation and
+on graceful shutdown of the API, worker, and MCP server; an unreachable trace
+backend logs a warning and never fails a run.
+
+Trace payloads contain graph state (job text, evidence snippets, verdicts), so
+point `LANGFUSE_HOST` at a trusted or self-hosted project.
+
+**Span hierarchy (2.4.2a).** Each run is a parent `analysis_run` span with
+child spans for the graph nodes — `analyse_role`, `retrieve_evidence`,
+`compare_evidence`, `policy_verifier`, and `approval_gate` (plus `planner`,
+`sprint`, and `drafts`). The `retrieve_evidence` span is annotated with the
+retrieved chunk count, per-requirement counts, and the hybrid RRF similarity
+scores, so retrieval quality is queryable on the span without parsing its output.
+
+**Persisted run metrics (2.4.2b).** Every model call's token usage is captured
+(the OpenAI backends record `usage` into a node-local collector checkpointed on
+the graph state) and summed into `total_tokens`; `estimated_cost_usd` is derived
+from a small public-pricing table (USD per 1M tokens; unknown models estimate
+zero cost while still counting tokens). Along with `latency_ms` and the unified
+`trace_id`, these persist on `analysis_runs` and are returned by
+`GET /api/v1/analyses/{run_id}` — queryable even outside the trace UI. The
+`trace_id` is recorded even when a run fails, so failures stay correlatable.
+
 ## Local ProofPath MCP Server (Read-Only & Approval-Gated Tools)
 
 Start the local MCP server over `stdio` (default for IDE / agent clients):

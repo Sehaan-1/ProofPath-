@@ -27,6 +27,7 @@ from proofpath.ingestion.job_fetcher import (
     JobPageFetcher,
     load_job_description,
 )
+from proofpath.observability.usage import record_response_usage
 from proofpath.policy.injection_guard import mask_pii
 from proofpath.policy.tool_trace import reject_model_tool_calls
 from proofpath.schemas.opportunity import (
@@ -136,6 +137,7 @@ class OpenAIRoleParser:
                 await self._sleeper(self.base_delay_seconds * (2**attempt))
                 attempt += 1
 
+        record_response_usage(self.model, completion)
         message = completion.choices[0].message
         reject_model_tool_calls(message)
         if message.refusal:

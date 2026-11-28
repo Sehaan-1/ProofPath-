@@ -36,6 +36,9 @@ _MANAGED_ENV_VARS = (
     "GOOGLE_CALENDAR_ID",
     "GOOGLE_CALENDAR_ACCESS_TOKEN",
     "OBSERVABILITY_BACKEND",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "LANGFUSE_HOST",
     "MAX_AGENT_RETRIES",
     "REDACT_PII",
     "ENABLE_GUARDRAILS",
@@ -64,6 +67,9 @@ def test_settings_defaults() -> None:
     assert settings.embedding_model == "text-embedding-3-small"
     assert settings.embedding_dimensions == 1536
     assert settings.observability_backend is ObservabilityBackend.NONE
+    assert settings.langfuse_public_key is None
+    assert settings.langfuse_secret_key is None
+    assert str(settings.langfuse_host).rstrip("/") == "https://cloud.langfuse.com"
     assert settings.max_agent_retries == 2
     assert settings.enable_guardrails is False
     assert settings.redact_pii is False
@@ -83,6 +89,8 @@ def test_settings_loads_all_env_vars_and_masks_secrets(
 ) -> None:
     fake_llm_key = "test-llm-key-value-987654"
     fake_gh_token = "test-gh-token-value-123456"
+    fake_lf_public = "pk-lf-test-111111"
+    fake_lf_secret = "sk-lf-test-222222"
 
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@db.internal:5432/proofpath")
     monkeypatch.setenv("REDIS_URL", "rediss://cache.internal:6379/2")
@@ -92,6 +100,9 @@ def test_settings_loads_all_env_vars_and_masks_secrets(
     monkeypatch.setenv("EMBEDDING_DIMENSIONS", "3072")
     monkeypatch.setenv("GITHUB_TOKEN", fake_gh_token)
     monkeypatch.setenv("OBSERVABILITY_BACKEND", "LangFuse")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", fake_lf_public)
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", fake_lf_secret)
+    monkeypatch.setenv("LANGFUSE_HOST", "http://localhost:3000")
     monkeypatch.setenv("MAX_AGENT_RETRIES", "3")
     monkeypatch.setenv("LOG_LEVEL", "debug")
     monkeypatch.setenv("ENABLE_GUARDRAILS", "true")
@@ -108,6 +119,8 @@ def test_settings_loads_all_env_vars_and_masks_secrets(
     assert settings.embedding_model == "text-embedding-3-large"
     assert settings.embedding_dimensions == 3072
     assert settings.observability_backend is ObservabilityBackend.LANGFUSE
+    assert str(settings.langfuse_host).rstrip("/") == "http://localhost:3000"
+    assert settings.require_langfuse_keys() == (fake_lf_public, fake_lf_secret)
     assert settings.max_agent_retries == 3
     assert settings.log_level is LogLevel.DEBUG
     assert settings.enable_guardrails is True
@@ -120,6 +133,9 @@ def test_settings_loads_all_env_vars_and_masks_secrets(
     assert fake_gh_token not in str(settings)
     assert fake_llm_key not in str(settings.model_dump())
     assert fake_gh_token not in str(settings.model_dump())
+    assert fake_lf_public not in repr(settings)
+    assert fake_lf_secret not in repr(settings)
+    assert fake_lf_secret not in str(settings.model_dump())
 
     # Explicit unwrapping helpers return the secret values.
     assert settings.require_llm_api_key() == fake_llm_key
@@ -132,6 +148,8 @@ def test_blank_secrets_normalize_to_none(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("GITHUB_TOKEN", "")
     monkeypatch.setenv("GOOGLE_CALENDAR_ID", " ")
     monkeypatch.setenv("GOOGLE_CALENDAR_ACCESS_TOKEN", "")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", " ")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "")
 
     settings = Settings(_env_file=None)
 
@@ -139,12 +157,17 @@ def test_blank_secrets_normalize_to_none(monkeypatch: pytest.MonkeyPatch) -> Non
     assert settings.github_token is None
     assert settings.google_calendar_id is None
     assert settings.google_calendar_access_token is None
+    assert settings.langfuse_public_key is None
+    assert settings.langfuse_secret_key is None
 
     with pytest.raises(ValueError, match="LLM_API_KEY"):
         settings.require_llm_api_key()
 
     with pytest.raises(ValueError, match="GITHUB_TOKEN"):
         settings.require_github_token()
+
+    with pytest.raises(ValueError, match="LANGFUSE_PUBLIC_KEY"):
+        settings.require_langfuse_keys()
 
 
 @pytest.mark.unit
@@ -156,6 +179,7 @@ def test_blank_secrets_normalize_to_none(monkeypatch: pytest.MonkeyPatch) -> Non
         ("REDIS_URL", "http://localhost:6379/0"),
         ("LLM_PROVIDER", "unsupported-provider"),
         ("OBSERVABILITY_BACKEND", "both"),
+        ("LANGFUSE_HOST", "not-a-url"),
         ("MAX_AGENT_RETRIES", "-1"),
         ("MAX_AGENT_RETRIES", "10"),
         ("EMBEDDING_MODEL", "   "),
@@ -193,6 +217,30 @@ def test_google_calendar_opt_in_requires_credentials(monkeypatch: pytest.MonkeyP
     # Secrets never render in logs/reprs.
     assert "secret-value" not in repr(settings)
     assert "SecretStr('**********')" in repr(settings)
+
+
+@pytest.mark.unit
+def test_langfuse_opt_in_requires_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sub-part 2.4.1a: selecting Langfuse fails closed without both keys."""
+    monkeypatch.setenv("OBSERVABILITY_BACKEND", "langfuse")
+
+    with pytest.raises(ValidationError, match="LANGFUSE_PUBLIC_KEY"):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    with pytest.raises(ValidationError, match="LANGFUSE_SECRET_KEY"):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    settings = Settings(_env_file=None)
+    assert settings.observability_backend is ObservabilityBackend.LANGFUSE
+    assert settings.require_langfuse_keys() == ("pk-lf-test", "sk-lf-test")
+
+    # The default backend (none) never requires Langfuse credentials.
+    monkeypatch.setenv("OBSERVABILITY_BACKEND", "none")
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY")
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY")
+    assert Settings(_env_file=None).langfuse_public_key is None
 
 
 @pytest.mark.unit

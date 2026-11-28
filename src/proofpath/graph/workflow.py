@@ -9,16 +9,23 @@ with LangGraph's native ``interrupt()``; resume the *same* thread with
 ``BoundedWorkflow.aresume({"decision": ..., "draft_id": ...})``.
 Node failures route to a terminal fallback with a sanitized error and best-effort
 audit record. Checkpoint and process-level failures cannot be handled by a node.
+
+Every invocation (including approval resumes) is wrapped by the run's
+observability tracer (Sub-slice 2.4.1): the configured backend's LangGraph
+callback handler is attached to the invocation config and bound to one unified
+trace ID derived from the analysis run, then flushed when the invocation ends.
+With ``OBSERVABILITY_BACKEND=none`` this adds no callbacks and no I/O.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from functools import partial
 from typing import Any
 from uuid import UUID
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.errors import GraphBubbleUp
@@ -49,6 +56,13 @@ from proofpath.graph.nodes import (
 )
 from proofpath.graph.state import ApprovalRequest, GraphError, ProofPathState
 from proofpath.ingestion.analyse_role import RoleParserBackend, is_retryable_role_parse_error
+from proofpath.observability.tracing import (
+    ANALYSIS_TRACE_NAME,
+    NullRunTracer,
+    RunTracer,
+    create_run_tracer,
+)
+from proofpath.observability.usage import collect_llm_usage
 from proofpath.policy.ledger_validator import LedgerValidator
 from proofpath.policy.output_guard import (
     OUTPUT_CONTRACT_REJECTED,
@@ -59,8 +73,33 @@ from proofpath.policy.output_guard import (
 from proofpath.policy.tool_trace import collect_tool_calls
 from proofpath.retrieval.embeddings import EmbeddingClient
 from proofpath.retrieval.hybrid_search import HybridSearcher
+from proofpath.schemas.evidence import EvidenceSnippet
 
 MAX_GRAPH_STEPS = 100
+
+
+def _retrieval_span_metadata(
+    evidence: Mapping[str, Sequence[EvidenceSnippet]],
+) -> dict[str, object]:
+    """Summarize retrieval for the ``retrieve_evidence`` span (Sub-part 2.4.2a).
+
+    Records the total retrieved chunk count, per-requirement counts, and the
+    hybrid RRF similarity scores so they are queryable on the span without
+    parsing its full output blob.
+    """
+    scores: list[float] = []
+    count = 0
+    per_requirement: dict[str, int] = {}
+    for requirement_id, snippets in evidence.items():
+        per_requirement[requirement_id] = len(snippets)
+        count += len(snippets)
+        scores.extend(round(s.score, 6) for s in snippets if s.score is not None)
+    return {
+        "retrieved_chunk_count": count,
+        "requirements_searched": len(evidence),
+        "chunks_per_requirement": per_requirement,
+        "similarity_scores": scores,
+    }
 
 
 Node = Callable[[ProofPathState, RunnableConfig], Awaitable[dict[str, object]]]
@@ -71,19 +110,37 @@ class StepBudgetExceededError(RuntimeError):
 
 
 class BoundedWorkflow:
-    """Async graph facade that enforces a fixed thread, recursion limit and sync durability."""
+    """Async graph facade that enforces a fixed thread, recursion limit and sync durability.
+
+    Also the single tracing attachment point (Sub-part 2.4.1b): every execution
+    enters the run tracer's invocation context, merges its callback handlers
+    into the invocation config, and flushes buffered spans afterwards. Direct
+    construction without a tracer (facade-level tests) is untraced;
+    ``build_workflow`` always binds a run-scoped tracer.
+    """
 
     def __init__(
         self,
         graph: CompiledStateGraph[ProofPathState, None, ProofPathState, ProofPathState],
         thread_id: str,
         step_budget: int,
+        tracer: RunTracer | None = None,
     ) -> None:
         self._graph = graph
         self._thread_id = thread_id
         self._step_budget = step_budget
+        self._tracer: RunTracer = tracer if tracer is not None else NullRunTracer(trace_id="")
 
-    def _config(self, config: RunnableConfig | None) -> RunnableConfig:
+    @property
+    def trace_id(self) -> str:
+        """Unified observability trace ID for this run (empty when unbound)."""
+        return self._tracer.trace_id
+
+    def _config(
+        self,
+        config: RunnableConfig | None,
+        callbacks: Sequence[BaseCallbackHandler] = (),
+    ) -> RunnableConfig:
         result: RunnableConfig = dict(config or {})  # type: ignore[assignment]
         configurable = dict(result.get("configurable", {}))
         if configurable.get("thread_id", self._thread_id) != self._thread_id:
@@ -91,6 +148,16 @@ class BoundedWorkflow:
         configurable["thread_id"] = self._thread_id
         result["configurable"] = configurable
         result["recursion_limit"] = self._step_budget + 4
+        if callbacks:
+            existing = result.get("callbacks")
+            if existing is None:
+                merged = list(callbacks)
+            elif isinstance(existing, list):
+                merged = [*existing, *callbacks]
+            else:
+                raise ValueError("Graph callbacks must be provided as a list of handlers")
+            result["callbacks"] = merged
+            result.setdefault("run_name", ANALYSIS_TRACE_NAME)
         return result
 
     async def ainvoke(
@@ -101,7 +168,11 @@ class BoundedWorkflow:
     ) -> Any:
         """Execute with a fixed upper bound; caller overrides cannot relax it."""
         kwargs["durability"] = "sync"
-        return await self._graph.ainvoke(input, self._config(config), **kwargs)
+        try:
+            with self._tracer.invocation() as callbacks:
+                return await self._graph.ainvoke(input, self._config(config, callbacks), **kwargs)
+        finally:
+            await self._tracer.flush()
 
     async def aresume(
         self,
@@ -126,10 +197,16 @@ class BoundedWorkflow:
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
-        """Stream with the same bound and durability as invocation."""
+        """Stream with the same bound, durability and tracing as invocation."""
         kwargs["durability"] = "sync"
-        async for item in self._graph.astream(input, self._config(config), **kwargs):
-            yield item
+        try:
+            with self._tracer.invocation() as callbacks:
+                async for item in self._graph.astream(
+                    input, self._config(config, callbacks), **kwargs
+                ):
+                    yield item
+        finally:
+            await self._tracer.flush()
 
     async def aget_state(
         self, config: RunnableConfig | None = None, *, subgraphs: bool = False
@@ -153,6 +230,7 @@ def build_workflow(
     calendar_end: datetime | None = None,
     step_budget: int = 50,
     top_k: int = 8,
+    tracer: RunTracer | None = None,
 ) -> BoundedWorkflow:
     """Build a graph tied to one persisted run and thread; no memory fallback.
 
@@ -160,11 +238,21 @@ def build_workflow(
     Invocation enforces a hard recursion limit.
     Reopen the saver before rebuilding
     a graph after process restart, with the same run, thread and dependencies.
+
+    The run's observability tracer is resolved from settings unless explicitly
+    supplied (Sub-slice 2.4.1); a misconfigured backend fails closed here,
+    before any node runs. Rebuilding for an approval resume derives the *same*
+    unified trace ID, so the resume joins the original trace.
     """
     if not thread_id.strip() or not 1 <= step_budget <= MAX_GRAPH_STEPS or not 1 <= top_k <= 50:
         raise ValueError("Invalid thread_id, step_budget or top_k")
     if not isinstance(checkpointer, AsyncPostgresSaver):
         raise TypeError("A live AsyncPostgresSaver is required")
+    run_tracer = (
+        tracer
+        if tracer is not None
+        else create_run_tracer(settings, analysis_run_id=analysis_run_id, thread_id=thread_id)
+    )
 
     def guard(state: ProofPathState, config: RunnableConfig) -> None:
         if config.get("configurable", {}).get("thread_id") != thread_id:
@@ -279,8 +367,12 @@ def build_workflow(
                 raise ValueError("Graph invocation thread_id does not match analysis run")
             working = state.copy()
             try:
-                with collect_tool_calls(state.get("tool_trace")) as calls:
+                with (
+                    collect_tool_calls(state.get("tool_trace")) as calls,
+                    collect_llm_usage(state.get("llm_usage")) as usage,
+                ):
                     working["tool_trace"] = calls
+                    working["llm_usage"] = usage
                     updates = await node(working, config)
             except GraphBubbleUp:
                 raise
@@ -299,9 +391,16 @@ def build_workflow(
                 if isinstance(exc, OutputContractError):
                     error = contract_error(name, exc)
                 updates = {"pending_error": error}
-            # Only the dispatcher supplies this channel, including calls in a failed node.
+            # Best-effort span enrichment; never affects the node's outcome.
+            if name == "retrieve_evidence":
+                evidence = updates.get("retrieved_evidence")
+                if isinstance(evidence, dict):
+                    run_tracer.annotate_current_span(metadata=_retrieval_span_metadata(evidence))
+            # Only the dispatcher supplies these channels, including a failed node's calls.
             if "tool_trace" in working:
                 updates["tool_trace"] = working["tool_trace"]
+            if "llm_usage" in working:
+                updates["llm_usage"] = working["llm_usage"]
             return updates
 
         return guarded
@@ -400,7 +499,7 @@ def build_workflow(
         ("analyse_role", analyse),
         ("retrieve_evidence", retrieve),
         ("compare_evidence", compare),
-        ("policy", policy),
+        ("policy_verifier", policy),
         ("sprint", sprint),
         ("drafts", drafts),
         ("approval_gate", approval),
@@ -417,9 +516,11 @@ def build_workflow(
     builder.add_conditional_edges(
         "retrieve_evidence", route("compare_evidence"), ["compare_evidence", "fallback_error"]
     )
-    builder.add_conditional_edges("compare_evidence", route("policy"), ["policy", "fallback_error"])
     builder.add_conditional_edges(
-        "policy", route_policy, ["compare_evidence", "sprint", "fallback_error"]
+        "compare_evidence", route("policy_verifier"), ["policy_verifier", "fallback_error"]
+    )
+    builder.add_conditional_edges(
+        "policy_verifier", route_policy, ["compare_evidence", "sprint", "fallback_error"]
     )
     builder.add_conditional_edges("sprint", route("drafts"), ["drafts", "fallback_error"])
     builder.add_conditional_edges(
@@ -427,7 +528,9 @@ def build_workflow(
     )
     builder.add_conditional_edges("approval_gate", route_approval, [END, "fallback_error"])
     builder.add_edge("fallback_error", END)
-    return BoundedWorkflow(builder.compile(checkpointer=checkpointer), thread_id, step_budget)
+    return BoundedWorkflow(
+        builder.compile(checkpointer=checkpointer), thread_id, step_budget, run_tracer
+    )
 
 
 def workflow_config(thread_id: str, *, step_budget: int = 50) -> RunnableConfig:
