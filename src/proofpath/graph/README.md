@@ -69,6 +69,11 @@ task (served as a downloadable `.ics`), and appends the immutable `audit_logs`
 record that carries the approval timestamp. No graph node ever performs those
 writes, and no draft is executed without a committed human approval.
 
+The MCP surface shares that service: `approve_action` (Sub-slice 2.1.4) checks the
+draft is `pending_approval` and the confirmation phrase, then calls
+`proofpath.approvals.decide_draft` with the same checkpointer/dependency wiring, so
+an approval from an IDE client finishes the paused run exactly like the HTTP API.
+
 `proofpath.graph.resume.resume_approval_run` is the service layer for that flow:
 it resolves the run from the thread, requires `awaiting_approval` and a real gate
 pause, atomically claims the run out of `awaiting_approval` (so only one resume

@@ -245,6 +245,36 @@ class TrackerRecord(StrictModel):
     updated_at: datetime
 
 
+class ActionDraftCreationResponse(StrictModel):
+    """Result of the side-effect-free `create_action_draft` tool (Sub-slice 2.1.4).
+
+    Only a `pending_approval` row is persisted: no tracker entry, calendar block,
+    or audit record is written until a human approves the draft.
+    """
+
+    draft: ActionDraftRecord
+    created: bool = Field(
+        description=(
+            "True when this call inserted the draft. False means an identical draft "
+            "already existed for the same idempotency_key and was returned unchanged."
+        ),
+    )
+    requires_approval: bool = Field(
+        default=True,
+        description="Always True: the draft is pending and no side effect has run.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_requires_approval(self) -> Self:
+        if not self.requires_approval:
+            raise ValueError(
+                "create_action_draft never executes; requires_approval is always True."
+            )
+        if self.draft.status is not ActionDraftStatus.PENDING_APPROVAL:
+            raise ValueError("create_action_draft only returns pending_approval drafts.")
+        return self
+
+
 class CalendarTaskRecord(StrictModel):
     """API response for a local calendar task materialized from an approved draft."""
 

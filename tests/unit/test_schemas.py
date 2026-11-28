@@ -23,6 +23,7 @@ from proofpath.db.models import (
 )
 from proofpath.schemas import (
     TOOL_INPUT_REGISTRY,
+    ActionDraftCreationResponse,
     ActionDraftRecord,
     AnalysisReport,
     AnalysisRunCreateRequest,
@@ -491,6 +492,42 @@ def test_draft_decision_response_contract() -> None:
     with pytest.raises(ValidationError):
         DraftDecisionResponse.model_validate(payload | {"thread_id": ""})
     _assert_extra_forbidden(DraftDecisionResponse, payload)
+
+
+@pytest.mark.unit
+def test_action_draft_creation_response_is_always_pending() -> None:
+    draft = {
+        "id": str(_DRAFT_ID),
+        "analysis_run_id": str(_RUN_ID),
+        "action_type": "tracker_upsert",
+        "status": "pending_approval",
+        "payload": {
+            "action_type": "tracker_upsert",
+            "opportunity_id": str(_OPP_ID),
+            "stage": "preparing",
+        },
+        "idempotency_key": f"proofpath:{_RUN_ID}:tracker_upsert",
+        "approved_at": None,
+        "executed_at": None,
+    }
+    payload = {"draft": draft, "created": True}
+
+    response = ActionDraftCreationResponse.model_validate(payload)
+    assert response.created is True
+    assert response.requires_approval is True
+    assert response.draft.status is ActionDraftStatus.PENDING_APPROVAL
+
+    # Only a fresh insert reports created=True; an existing draft is returned as-is.
+    assert ActionDraftCreationResponse.model_validate(payload | {"created": False}).created is False
+
+    # The tool is side-effect free by contract: it can never report an executed draft.
+    with pytest.raises(ValidationError, match="pending_approval"):
+        ActionDraftCreationResponse.model_validate(
+            {"draft": draft | {"status": "executed"}, "created": True}
+        )
+    with pytest.raises(ValidationError, match="requires_approval"):
+        ActionDraftCreationResponse.model_validate(payload | {"requires_approval": False})
+    _assert_extra_forbidden(ActionDraftCreationResponse, payload)
 
 
 @pytest.mark.unit

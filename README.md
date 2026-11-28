@@ -83,7 +83,7 @@ Calendar API (`events.import`); the local task and `.ics` file are always writte
 first and remain the source of truth. With the flag off, ProofPath makes no network
 call at all.
 
-## Local ProofPath MCP Server (Read-Only Tools)
+## Local ProofPath MCP Server (Read-Only & Approval-Gated Tools)
 
 Start the local MCP server over `stdio` (default for IDE / agent clients):
 
@@ -103,3 +103,7 @@ Exposed read-only tools (`extra="forbid"` input validation):
 - `get_opportunity(opportunity_id)` — read a persisted opportunity and structured requirements.
 - `get_application_status(opportunity_id)` — inspect personal tracker status (`tracked`, `stage`, `notes`).
 - `get_action_draft(draft_id)` — inspect a `pending_approval` or historical action draft without executing it.
+
+Approval-gated tools (Slice 2.1.4; `read_only_hint=false`, `idempotent_hint=true`):
+- `create_action_draft(analysis_run_id, payload, idempotency_key)` — **side-effect free**. Persists one `pending_approval` `action_drafts` row and nothing else: no tracker entry, no calendar task, no audit record. The `idempotency_key` must be the canonical draft key `proofpath:<run_id>:<action_type>`, so a repeated call returns the existing draft (`created=false`) instead of queueing a duplicate, and a different payload under the same key is refused. A run that is itself `awaiting_approval` is refused: its gate only accepts decisions for the drafts it queued, so approve or reject those first.
+- `approve_action(draft_id, confirmation_phrase)` — the only MCP tool that executes side effects. It refuses unless the draft is `pending_approval` **and** `confirmation_phrase` is exactly `"approve action"` (case/whitespace tolerant, nothing else). Then it delegates to the same `proofpath.approvals.decide_draft` service as the HTTP API, so the compare-and-set decision, the paused-run resume, the approved-only executor (tracker advance or `.ics` calendar block plus the immutable audit record) and the replay semantics are identical: repeating the call returns `already_processed=true` with the original `audit_log_id` and executes nothing twice. `rejected`/`failed` drafts are refused, and a paused run whose model wiring is unconfigured fails closed before any write.

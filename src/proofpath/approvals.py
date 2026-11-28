@@ -53,6 +53,7 @@ from proofpath.execution import (
     DraftExecution,
     DraftExecutor,
     DraftNotExecutableError,
+    execution_record,
 )
 from proofpath.execution import (
     DraftNotFoundError as ExecutionDraftNotFoundError,
@@ -60,7 +61,7 @@ from proofpath.execution import (
 from proofpath.graph.approval import ApprovalError, ApprovalStateError
 from proofpath.graph.dependencies import GraphDependencies
 from proofpath.graph.resume import resume_approval_run
-from proofpath.schemas.actions import ActionDraftRecord
+from proofpath.schemas.actions import ActionDraftRecord, DraftDecisionResponse
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +142,9 @@ async def _execute_if_approved(
 async def _resume_if_paused(
     *,
     session_factory: async_sessionmaker[AsyncSession],
-    checkpointer: AsyncPostgresSaver,
+    checkpointer: AsyncPostgresSaver | None,
     settings: Settings,
-    dependencies: GraphDependencies,
+    dependencies: GraphDependencies | None,
     thread_id: str,
     draft_id: uuid.UUID,
     decision: DraftDecision,
@@ -152,6 +153,8 @@ async def _resume_if_paused(
     """Resume a still-paused run; never fail the request on resume trouble."""
     if run_status is not AnalysisRunStatus.AWAITING_APPROVAL:
         return
+    if checkpointer is None or dependencies is None:  # pragma: no cover - guarded above
+        raise RuntimeError("A paused run cannot be resumed without a checkpointer.")
     try:
         await resume_approval_run(
             checkpointer=checkpointer,
@@ -178,9 +181,9 @@ async def decide_draft(
     draft_id: uuid.UUID,
     decision: DraftDecision,
     session_factory: async_sessionmaker[AsyncSession],
-    checkpointer: AsyncPostgresSaver,
+    checkpointer: AsyncPostgresSaver | None = None,
     settings: Settings,
-    dependencies: GraphDependencies,
+    dependencies: GraphDependencies | None = None,
 ) -> DraftDecisionResult:
     """Approve or reject one draft and finish its paused run, idempotently.
 
@@ -188,12 +191,23 @@ async def decide_draft(
     ``DraftConflictError`` when the draft is already in a contradictory state.
     Container/model configuration must be validated by the caller before this
     runs, so a failure here cannot leave a half-applied decision.
+
+    ``checkpointer``/``dependencies`` are only needed to finish a run that is
+    still ``awaiting_approval`` (every API caller passes them); a decision on a
+    finalised run works without them, which is what lets the MCP approval tool
+    decide historical drafts on a key-less server.
     """
     if decision not in ("approved", "rejected"):
         raise ValueError("decision must be 'approved' or 'rejected'.")
     already_processed, run_status, thread_id = await _apply_decision(
         session_factory, draft_id=draft_id, decision=decision
     )
+    if run_status is AnalysisRunStatus.AWAITING_APPROVAL and (
+        checkpointer is None or dependencies is None
+    ):
+        raise ValueError(
+            "Resuming a paused analysis run requires a checkpointer and graph dependencies."
+        )
     await _resume_if_paused(
         session_factory=session_factory,
         checkpointer=checkpointer,
@@ -227,3 +241,15 @@ async def decide_draft(
             thread_id=thread_id,
             execution=execution,
         )
+
+
+def decision_response(result: DraftDecisionResult) -> DraftDecisionResponse:
+    """Map a committed decision (plus its execution) to its API/MCP response contract."""
+    return DraftDecisionResponse(
+        draft=result.draft,
+        decision=result.decision,
+        already_processed=result.already_processed,
+        run_status=result.run_status,
+        thread_id=result.thread_id,
+        execution=execution_record(result.execution) if result.execution is not None else None,
+    )

@@ -25,10 +25,10 @@ from proofpath.approvals import (
     DraftDecisionResult,
     DraftNotFoundError,
     decide_draft,
+    decision_response,
 )
 from proofpath.db.models import ActionDraftStatus
 from proofpath.db.repositories.draft import DraftDecision, DraftRepo, draft_record
-from proofpath.execution import execution_record
 from proofpath.graph.dependencies import GraphDependenciesError, create_graph_dependencies
 from proofpath.schemas.actions import ActionDraftRecord, DraftDecisionResponse
 
@@ -78,24 +78,13 @@ async def _decide(
         raise HTTPException(409, "Action draft was already decided differently.") from exc
 
 
-def _response(result: DraftDecisionResult) -> DraftDecisionResponse:
-    return DraftDecisionResponse(
-        draft=result.draft,
-        decision=result.decision,
-        already_processed=result.already_processed,
-        run_status=result.run_status,
-        thread_id=result.thread_id,
-        execution=execution_record(result.execution) if result.execution is not None else None,
-    )
-
-
 @router.post("/drafts/{draft_id}/approve", response_model=DraftDecisionResponse)
 async def approve_draft(draft_id: uuid.UUID, request: Request) -> DraftDecisionResponse:
     """Approve one pending draft and resume its run on the bound `thread_id`."""
-    return _response(await _decide(draft_id, decision="approved", request=request))
+    return decision_response(await _decide(draft_id, decision="approved", request=request))
 
 
 @router.post("/drafts/{draft_id}/reject", response_model=DraftDecisionResponse)
 async def reject_draft(draft_id: uuid.UUID, request: Request) -> DraftDecisionResponse:
     """Reject one pending draft; the run resumes and ends with no side effects."""
-    return _response(await _decide(draft_id, decision="rejected", request=request))
+    return decision_response(await _decide(draft_id, decision="rejected", request=request))

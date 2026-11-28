@@ -2,6 +2,7 @@
 
 from proofpath.schemas.actions import (
     ACTION_DRAFT_PAYLOAD_ADAPTER,
+    ActionDraftCreationResponse,
     ActionDraftPayload,
     ActionDraftRecord,
     ApplicationStatusResponse,
@@ -51,6 +52,7 @@ from proofpath.schemas.tools import (
 __all__ = [
     "ACTION_DRAFT_PAYLOAD_ADAPTER",
     "TOOL_INPUT_REGISTRY",
+    "ActionDraftCreationResponse",
     "ActionDraftPayload",
     "ActionDraftRecord",
     "AnalysisReport",
