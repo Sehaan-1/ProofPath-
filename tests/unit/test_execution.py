@@ -330,6 +330,16 @@ async def test_approved_tracker_draft_upserts_tracker_and_audits_the_approval(
     assert world.savepoint_rollbacks == 0
 
 
+async def test_concurrent_approval_cannot_execute_during_output_validation(monkeypatch):
+    world = World()
+    world.run.status = AnalysisRunStatus.RUNNING
+    _install(monkeypatch, world)
+    with pytest.raises(DraftNotExecutableError, match="validation"):
+        await _executor(world).execute(world.draft.id)
+    assert world.tracker_calls == []
+    assert world.marked == []
+
+
 @pytest.mark.parametrize(
     "status",
     [

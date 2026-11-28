@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proofpath.config import LLMProvider, Settings
 from proofpath.db.models import AnalysisRunStatus, BackgroundJob
-from proofpath.db.repositories.analysis import AnalysisRepo, ClaimVerdictInput
+from proofpath.db.repositories.analysis import AnalysisRepo
 from proofpath.db.repositories.background_job import BackgroundJobRepo
 from proofpath.db.repositories.evidence import EvidenceRepo
 from proofpath.db.repositories.opportunity import OpportunityRepo
@@ -169,7 +169,8 @@ async def execute_analysis_graph(
     """Run one LangGraph analysis run to a terminal state and persist the outcome.
 
     Shared by the synchronous API path and the ``analysis_run`` worker handler so
-    verdict persistence, metric recording, and status derivation stay identical.
+    metric recording and status derivation stay identical. The graph validates and
+    persists verdicts atomically with the pending drafts, *before* its interrupt.
     The caller builds (and validates) ``dependencies`` so wiring failures surface
     before any run row is created. On an unhandled exception the run is marked
     ``failed`` and the exception re-raises (the API maps that to 503; the handler
@@ -194,7 +195,7 @@ async def execute_analysis_graph(
             initial_state(opportunity_id, settings=settings), thread_config(thread_id)
         )
         errors = state.get("errors", [])
-        verified = state.get("policy_verified", False)
+        verified = state.get("output_validated") is True and state.get("policy_verified") is True
         interrupts = state.get("__interrupt__") or ()
         paused_for_approval = approval_request_from_interrupts(interrupts) is not None and bool(
             state.get("draft_actions")
@@ -207,21 +208,6 @@ async def execute_analysis_graph(
             status = AnalysisRunStatus.COMPLETED
         async with session_factory.begin() as session:
             repo = AnalysisRepo(session)
-            if verified:
-                await repo.upsert_verdicts(
-                    run_id,
-                    [
-                        ClaimVerdictInput(
-                            requirement_id=v.requirement_id,
-                            verdict=v.verdict,
-                            claim_summary=v.claim_summary,
-                            cited_chunk_ids=v.cited_chunk_ids,
-                            policy_downgraded=v.policy_downgraded,
-                            gap_notes=v.gap_notes,
-                        )
-                        for v in state.get("verdicts", [])
-                    ],
-                )
             await repo.update_run_metrics(
                 run_id, status=status, latency_ms=int((time.monotonic() - started) * 1000)
             )

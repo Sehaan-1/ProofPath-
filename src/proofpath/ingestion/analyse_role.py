@@ -27,6 +27,8 @@ from proofpath.ingestion.job_fetcher import (
     JobPageFetcher,
     load_job_description,
 )
+from proofpath.policy.injection_guard import mask_pii
+from proofpath.policy.tool_trace import reject_model_tool_calls
 from proofpath.schemas.opportunity import (
     OpportunityCreateRequest,
     OpportunityResponse,
@@ -97,6 +99,7 @@ class OpenAIRoleParser:
         model: str,
         api_key: str | None = None,
         client: AsyncOpenAI | None = None,
+        redact_pii: bool = False,
         max_retries: int = DEFAULT_MAX_RETRIES,
         base_delay_seconds: float = DEFAULT_BASE_DELAY_SECONDS,
         sleeper: Sleeper | None = None,
@@ -106,11 +109,14 @@ class OpenAIRoleParser:
         self.model = model
         self.max_retries = max_retries
         self.base_delay_seconds = base_delay_seconds
+        self._redact_pii = redact_pii
         self._client = client or AsyncOpenAI(api_key=api_key)
         self._sleeper: Sleeper = sleeper if sleeper is not None else asyncio.sleep
 
     async def parse(self, parser_prompt: str) -> ParsedRole:
         """Invoke chat.completions.parse with `response_format=ParsedRole`."""
+        if self._redact_pii:
+            parser_prompt = mask_pii(parser_prompt)
         attempt = 0
         while True:
             try:
@@ -131,6 +137,7 @@ class OpenAIRoleParser:
                 attempt += 1
 
         message = completion.choices[0].message
+        reject_model_tool_calls(message)
         if message.refusal:
             raise RoleParseError(
                 f"analyse_role refused to parse the job description: {message.refusal}"
@@ -234,6 +241,7 @@ def create_role_parser(
         model=settings.llm_model,
         api_key=api_key,
         client=client,
+        redact_pii=settings.redact_pii,
         sleeper=sleeper,
     )
 

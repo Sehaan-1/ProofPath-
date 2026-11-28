@@ -37,6 +37,7 @@ from proofpath.config import Settings, get_settings
 from proofpath.db.models import (
     ActionDraftStatus,
     ActionType,
+    AnalysisRunStatus,
     AuditActor,
     AuditLog,
     CalendarTask,
@@ -312,6 +313,10 @@ class DraftExecutor:
                     ExecutionErrorCode.MISSING_OPPORTUNITY,
                     "Analysis run for the draft no longer exists.",
                 )
+            # A concurrent approval may see a committed decision while another
+            # caller still owns the resume. Do not race final output validation.
+            if run.status is AnalysisRunStatus.RUNNING:
+                raise DraftNotExecutableError("The analysis run has not finished validation.")
             opportunity_id = run.opportunity_id
             async with session.begin_nested():
                 target = await self._apply_side_effect(
@@ -330,6 +335,8 @@ class DraftExecutor:
                         target=target,
                     ),
                 )
+        except DraftNotExecutableError:
+            raise  # In-flight resume: leave the draft untouched for its owner.
         except DraftExecutionError as exc:
             entry = await self._record_failure(session, snapshot, exc)
             return DraftExecution(

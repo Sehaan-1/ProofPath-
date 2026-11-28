@@ -120,6 +120,9 @@ class AnalysisReport(StrictModel):
         description="LangGraph checkpoint thread id for resume/approval.",
     )
     status: AnalysisRunStatus
+    injection_detected: bool = Field(
+        default=False, description="A known instruction pattern was detected in the source JD."
+    )
     role: ParsedRole | None = None
     requirements: list[RequirementRecord] = Field(default_factory=list)
     verdicts: list[ClaimVerdictSchema] = Field(default_factory=list)

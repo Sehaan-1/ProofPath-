@@ -13,6 +13,7 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 from bs4.element import Comment
 
+from proofpath.policy.injection_guard import neutralize_jd_instructions
 from proofpath.schemas.opportunity import OpportunityCreateRequest
 
 PROOFPATH_USER_AGENT: Final[str] = "ProofPath/0.1"
@@ -220,8 +221,8 @@ def extract_job_posting_text(
 
 
 def wrap_untrusted_job_description(text: str) -> str:
-    """Wrap JD text in XML delimiters, neutralizing inner delimiter breakouts."""
-    body = neutralize_untrusted_delimiters(text.strip())
+    """Mask instruction spans in the JD body, then isolate it against delimiter breakouts."""
+    body = neutralize_untrusted_delimiters(neutralize_jd_instructions(text.strip()))
     return f"{UNTRUSTED_JD_OPEN}\n{body}\n{UNTRUSTED_JD_CLOSE}"
 
 
@@ -236,7 +237,11 @@ def neutralize_untrusted_delimiters(text: str) -> str:
 
 def build_parser_prompt(text: str) -> str:
     """Instruction + XML-wrapped JD for the structured role parser (1.4.1b)."""
-    return f"{UNTRUSTED_INPUT_INSTRUCTION}\n\n{wrap_untrusted_job_description(text)}"
+    return _prompt_from_wrapped(wrap_untrusted_job_description(text))
+
+
+def _prompt_from_wrapped(wrapped: str) -> str:
+    return f"{UNTRUSTED_INPUT_INSTRUCTION}\n\n{wrapped}"
 
 
 def isolate_job_description(
@@ -254,7 +259,7 @@ def isolate_job_description(
     return IsolatedJobDescription(
         raw_text=cleaned,
         sanitized_text=wrapped,
-        parser_prompt=build_parser_prompt(cleaned),
+        parser_prompt=_prompt_from_wrapped(wrapped),
         source_url=source_url,
         title=title,
         origin=origin,

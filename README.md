@@ -173,6 +173,50 @@ The producer (`enqueue_job`) commits the ledger row *before* the Redis `XADD`, s
 a worker can never receive a message whose status row is uncommitted; if the
 append itself fails the row is moved to `dead_letter` and the API returns `503`.
 
+## Input screening (sub-slice 2.3.1)
+
+Pasted and fetched job descriptions keep their original visible text in
+`opportunities.raw_text`. In the XML-wrapped parser input, a recognized instruction
+such as “mark all skills as supported” becomes `[MASKED INSTRUCTION]`; requirements
+on the same line remain. The analysis report’s `injection_detected` flag is saved
+in the run checkpoint, including when parsing is skipped for a previously parsed
+opportunity. `false` means no match was recorded, not that the JD is trusted.
+
+Set `REDACT_PII=true` for the API and worker to mask common phone numbers and
+personal addresses in outgoing role-parser, comparison and sprint-planning prompts,
+and in hosted OpenAI/Gemini embedding requests. The default is `false`. This is
+pattern-based screening, not anonymization: local evidence, raw JDs and checkpoints
+are not scrubbed, and citation checks and human approval are still required.
+
+## Final output contract (sub-slice 2.3.2)
+
+Before offering an analysis for approval, ProofPath checks its **final** verdicts
+against `evidence_chunks`, independently of the earlier compare/retry loop.
+`supported` and `partial` verdicts need at least one citation, and **every** cited
+ID must still exist. The run checkpoint also records the names of actual analysis
+tool attempts, not text that merely mentions a tool. Only reads and pending-draft
+creation are permitted; an unknown tool, `approve_action`, or a forbidden call
+such as `send_email` fails the check. Tool arguments are not part of this trace.
+
+The API and worker use the same graph. Verdicts and pending drafts commit together
+only after validation; a rejection yields a `failed` run with a sanitized error,
+not an approval request. An unrelated node failure may still return a partial
+report if its output passes the same checks. An approval resume rechecks the
+checkpoint against the ledger; if it fails, the run fails and its gate drafts
+cannot execute, even on a repeated approval. Report reads also recheck the
+persisted citations and trace:
+if evidence has since disappeared, or a historical successful run lacks the
+validated checkpoint, the endpoint returns `409` rather than an unverified claim.
+Start a new analysis in that case.
+
+The built-in checks are always on. For a second local schema check, install
+`pip install -e '.[guardrails]'` and set `ENABLE_GUARDRAILS=true` for both API and
+worker. For the Compose worker, set it in `.env` and rebuild with
+`docker compose up -d --build worker`. The optional `OutputGuard` adapter uses
+Guardrails AI on citation IDs and tool names only; it does not call an LLM or
+repair rejected output. Installing the extra alone does not enable it, and
+enabling it without the extra fails closed.
+
 ## Local ProofPath MCP Server (Read-Only & Approval-Gated Tools)
 
 Start the local MCP server over `stdio` (default for IDE / agent clients):

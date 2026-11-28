@@ -20,6 +20,7 @@ from openai import (
 from proofpath.config import LLMProvider, Settings
 from proofpath.db.models import EMBEDDING_DIM
 from proofpath.db.repositories.evidence import EvidenceChunkInput
+from proofpath.policy.injection_guard import mask_pii
 
 DEFAULT_BATCH_SIZE: Final[int] = 64
 DEFAULT_MAX_RETRIES: Final[int] = 3
@@ -127,13 +128,16 @@ class OpenAIEmbeddingBackend:
         dimensions: int,
         *,
         client: AsyncOpenAI | None = None,
+        redact_pii: bool = False,
     ) -> None:
         self._model = model
         self._dimensions = dimensions
         self._client = client or AsyncOpenAI(api_key=api_key)
+        self._redact_pii = redact_pii
 
     async def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
-        kwargs: dict[str, object] = {"model": self._model, "input": list(texts)}
+        inputs = [mask_pii(text) for text in texts] if self._redact_pii else list(texts)
+        kwargs: dict[str, object] = {"model": self._model, "input": inputs}
         if self._model.startswith("text-embedding-3"):
             kwargs["dimensions"] = self._dimensions
         response = await self._client.embeddings.create(**kwargs)  # type: ignore[arg-type]
@@ -151,8 +155,10 @@ class GeminiEmbeddingBackend:
         *,
         http_client: httpx.AsyncClient | None = None,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
+        redact_pii: bool = False,
     ) -> None:
         self._api_key = api_key
+        self._redact_pii = redact_pii
         self._model = model if model.startswith("models/") else f"models/{model}"
         self._base_url = base_url.rstrip("/")
         self._http = http_client
@@ -162,7 +168,7 @@ class GeminiEmbeddingBackend:
             "requests": [
                 {
                     "model": self._model,
-                    "content": {"parts": [{"text": text}]},
+                    "content": {"parts": [{"text": mask_pii(text) if self._redact_pii else text}]},
                 }
                 for text in texts
             ]
@@ -279,6 +285,7 @@ def is_retryable_embedding_error(exc: BaseException) -> bool:
 def _backend_from_settings(settings: Settings) -> EmbeddingBackend:
     if settings.llm_provider is LLMProvider.GEMINI:
         return GeminiEmbeddingBackend(
+            redact_pii=settings.redact_pii,
             api_key=settings.require_llm_api_key(),
             model=settings.embedding_model,
         )
@@ -287,6 +294,7 @@ def _backend_from_settings(settings: Settings) -> EmbeddingBackend:
     if settings.embedding_model in {"hash", "local-hash", "deterministic"}:
         return HashEmbeddingBackend(dimensions=settings.embedding_dimensions)
     return OpenAIEmbeddingBackend(
+        redact_pii=settings.redact_pii,
         api_key=settings.require_llm_api_key(),
         model=settings.embedding_model,
         dimensions=settings.embedding_dimensions,

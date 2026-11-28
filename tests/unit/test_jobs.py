@@ -165,15 +165,19 @@ def _fake_dependencies() -> object:
     )
 
 
-async def test_execute_analysis_graph_persists_verified_verdicts(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("validated", "expected"),
+    [(True, AnalysisRunStatus.COMPLETED), (False, AnalysisRunStatus.FAILED)],
+)
+async def test_execute_analysis_graph_requires_final_contract_not_only_policy(
+    monkeypatch, validated, expected
+) -> None:
     run_id = uuid.uuid4()
     opp_id = uuid.uuid4()
     runs = {run_id: SimpleNamespace(status=AnalysisRunStatus.RUNNING)}
 
     class Repo:
-        async def upsert_verdicts(self, _run_id, verdicts):
-            runs[_run_id].verdicts = list(verdicts)
-
+        # Verdicts now commit in the graph's validated draft transaction.
         async def update_run_metrics(self, _run_id, *, status, latency_ms):
             runs[_run_id].status = status
             runs[_run_id].latency_ms = latency_ms
@@ -189,16 +193,7 @@ async def test_execute_analysis_graph_persists_verified_verdicts(monkeypatch) ->
                     "errors": [],
                     "draft_actions": [],
                     "__interrupt__": (),
-                    "verdicts": [
-                        SimpleNamespace(
-                            requirement_id=uuid.uuid4(),
-                            verdict="supported",
-                            claim_summary="x",
-                            cited_chunk_ids=[uuid.uuid4()],
-                            policy_downgraded=False,
-                            gap_notes=None,
-                        )
-                    ],
+                    "output_validated": validated,
                 }
             )
         ),
@@ -214,9 +209,8 @@ async def test_execute_analysis_graph_persists_verified_verdicts(monkeypatch) ->
         run_id=run_id,
         thread_id="t-1",
     )
-    assert status is AnalysisRunStatus.COMPLETED
-    assert runs[run_id].status is AnalysisRunStatus.COMPLETED
-    assert len(runs[run_id].verdicts) == 1
+    assert status is expected
+    assert runs[run_id].status is expected
 
 
 async def test_execute_analysis_graph_marks_failed_on_exception(monkeypatch) -> None:

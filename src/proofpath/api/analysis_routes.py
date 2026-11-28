@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from proofpath.api.routes import Session, _job_queue
@@ -15,6 +15,7 @@ from proofpath.config import LLMProvider
 from proofpath.db.models import AnalysisRunStatus, JobStatus
 from proofpath.db.repositories.analysis import AnalysisRepo
 from proofpath.db.repositories.draft import draft_record
+from proofpath.db.repositories.evidence import EvidenceRepo
 from proofpath.db.repositories.opportunity import OpportunityRepo
 from proofpath.graph.checkpointer import thread_config
 from proofpath.graph.dependencies import GraphDependenciesError, create_graph_dependencies
@@ -23,6 +24,12 @@ from proofpath.jobs import (
     AnalysisRunJobPayload,
     enqueue_job,
     execute_analysis_graph,
+)
+from proofpath.policy.output_guard import (
+    OutputContractError,
+    OutputGuardUnavailableError,
+    optional_output_guard,
+    validate_final_output,
 )
 from proofpath.schemas.analysis import AnalysisReport, AnalysisRunCreateRequest, ClaimVerdictSchema
 from proofpath.schemas.jobs import JobAcceptedResponse
@@ -166,20 +173,45 @@ async def _get_report(run_id: uuid.UUID, request: Request, session: AsyncSession
                 "retryable": False,
             }
         ]
-    drafts = [draft_record(d) for d in run.action_drafts]
-    verdicts = [ClaimVerdictSchema.model_validate(v) for v in run.claim_verdicts]
+    # A checkpoint or DB row alone isn't proof of validation. In particular a
+    # running graph can already have checkpointed raw model output. Old successful
+    # runs with no trace must not be advertised as having passed the new contract.
+    validated = state.get("output_validated") is True and state.get("policy_verified") is True
+    if not validated and run.status in {
+        AnalysisRunStatus.COMPLETED,
+        AnalysisRunStatus.AWAITING_APPROVAL,
+    }:
+        raise HTTPException(409, "No validated output checkpoint; start a new analysis.")
+    publish = validated and run.status is not AnalysisRunStatus.RUNNING
+    verdicts: list[ClaimVerdictSchema] = []
+    if publish:
+        try:
+            verdicts = [ClaimVerdictSchema.model_validate(v) for v in run.claim_verdicts]
+            # Check the rows we're *actually returning*: cited chunks may have
+            # disappeared since the pause/resume or the previous report read.
+            await validate_final_output(
+                verdicts,
+                state.get("tool_trace"),
+                lookup=EvidenceRepo(session).get_existing_chunk_ids,
+                extra_guard=optional_output_guard(request.app.state.settings),
+            )
+        except OutputGuardUnavailableError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except (OutputContractError, ValidationError) as exc:
+            raise HTTPException(
+                409, "Stored analysis output failed validation; start a new analysis."
+            ) from exc
     return AnalysisReport(
         analysis_run_id=run.id,
         opportunity_id=run.opportunity_id,
         thread_id=run.thread_id,
         status=run.status,
+        injection_detected=state.get("injection_detected", False),
         role=role,
         requirements=requirements,
         verdicts=verdicts,
-        contribution_sprint=state.get("contribution_sprint")
-        if state.get("policy_verified")
-        else None,
-        action_drafts=drafts,
+        contribution_sprint=state.get("contribution_sprint") if publish else None,
+        action_drafts=[draft_record(d) for d in run.action_drafts] if publish else [],
         total_tokens=run.total_tokens,
         estimated_cost_usd=run.estimated_cost_usd,
         latency_ms=run.latency_ms,
