@@ -16,6 +16,7 @@ from pydantic import Field
 
 from proofpath.config import Settings, get_settings
 from proofpath.db.models import ActionType
+from proofpath.observability.usage import LLMUsage
 from proofpath.policy.ledger_validator import DowngradeReason
 from proofpath.schemas.actions import ActionDraftRecord, ContributionSprintPlan
 from proofpath.schemas.analysis import ClaimVerdictSchema
@@ -89,6 +90,7 @@ class ProofPathState(TypedDict):
     opportunity_id: uuid.UUID
     injection_detected: NotRequired[bool]
     tool_trace: NotRequired[list[str]]
+    llm_usage: NotRequired[list[LLMUsage]]
     requirements: NotRequired[list[RequirementRecord]]
     retrieved_evidence: NotRequired[dict[str, list[EvidenceSnippet]]]
     verdicts: NotRequired[list[ClaimVerdictSchema]]
@@ -116,6 +118,7 @@ def initial_state(opportunity_id: uuid.UUID, *, settings: Settings | None = None
         "opportunity_id": opportunity_id,
         "injection_detected": False,
         "tool_trace": [],
+        "llm_usage": [],
         "output_validated": False,
         "requirements": [],
         "retrieved_evidence": {},

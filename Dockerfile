@@ -19,11 +19,19 @@ COPY pyproject.toml alembic.ini ./
 COPY src/ ./src/
 COPY migrations/ ./migrations/
 
+# Optional extras are opt-in at build time so the default image stays lean:
+# ENABLE_GUARDRAILS installs the guardrails extra; OBSERVABILITY_BACKEND=langfuse
+# installs the isolated observability extra (Sub-part 2.4.1a).
 ARG ENABLE_GUARDRAILS=false
-RUN case "$(echo "$ENABLE_GUARDRAILS" | tr '[:upper:]' '[:lower:]')" in \
-      1|true|yes|on|t|y) pip install '.[guardrails]' ;; \
-      *) pip install . ;; \
-    esac
+ARG OBSERVABILITY_BACKEND=none
+RUN extras=""; \
+    case "$(echo "$ENABLE_GUARDRAILS" | tr '[:upper:]' '[:lower:]')" in \
+      1|true|yes|on|t|y) extras="guardrails" ;; \
+    esac; \
+    case "$(echo "$OBSERVABILITY_BACKEND" | tr '[:upper:]' '[:lower:]')" in \
+      langfuse) extras="${extras:+${extras},}observability" ;; \
+    esac; \
+    if [ -n "$extras" ]; then pip install ".[${extras}]"; else pip install .; fi
 
 # Run the worker as a non-root user.
 RUN useradd --create-home --uid 1000 proofpath \

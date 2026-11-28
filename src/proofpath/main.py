@@ -27,6 +27,7 @@ from proofpath.api.routes import router
 from proofpath.config import Settings, get_settings
 from proofpath.db.session import create_db_engine, create_session_factory, verify_pgvector_extension
 from proofpath.graph.checkpointer import postgres_checkpointer
+from proofpath.observability.tracing import shutdown_tracing
 from proofpath.workers.queue import JobQueue
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                     yield
                 finally:
                     await job_queue.close()
+                    # Flush/release the tracing backend (no-op unless enabled).
+                    await shutdown_tracing()
                     del application.state.job_queue
                     del application.state.checkpointer
                     del application.state.session_factory

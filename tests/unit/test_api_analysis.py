@@ -85,9 +85,24 @@ def app_services(monkeypatch):
             )
             return runs[run_id]
 
-        async def update_run_metrics(self, run_id, *, status, latency_ms):
+        async def update_run_metrics(
+            self,
+            run_id,
+            *,
+            status,
+            latency_ms,
+            total_tokens=None,
+            estimated_cost_usd=None,
+            trace_id=None,
+        ):
             runs[run_id].status = status
             runs[run_id].latency_ms = latency_ms
+            if total_tokens is not None:
+                runs[run_id].total_tokens = total_tokens
+            if estimated_cost_usd is not None:
+                runs[run_id].estimated_cost_usd = estimated_cost_usd
+            if trace_id is not None:
+                runs[run_id].trace_id = trace_id
 
         async def get_run_by_id(self, run_id, **kwargs):
             return runs.get(run_id)
@@ -145,7 +160,7 @@ def app_services(monkeypatch):
             )
             return result
 
-        return SimpleNamespace(ainvoke=invoke)
+        return SimpleNamespace(ainvoke=invoke, trace_id="unified-trace-id")
 
     monkeypatch.setattr(jobs, "build_workflow", build)
 

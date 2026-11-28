@@ -25,6 +25,7 @@ from proofpath.config import Settings, get_settings
 from proofpath.db.session import create_db_engine, create_session_factory
 from proofpath.graph.checkpointer import postgres_checkpointer
 from proofpath.jobs import create_task_registry
+from proofpath.observability.tracing import shutdown_tracing
 from proofpath.workers.queue import JobQueue
 from proofpath.workers.worker import SqlAlchemyJobStore, Worker
 
@@ -108,6 +109,8 @@ async def main() -> None:
                 checkpointer=None,
             )
     finally:
+        # Flush/release the tracing backend before closing infrastructure.
+        await shutdown_tracing()
         await engine.dispose()
         await queue.close()
         logger.info("ProofPath worker shut down.")

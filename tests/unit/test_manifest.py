@@ -79,7 +79,14 @@ def test_optional_extras_are_isolated_from_core_dependencies() -> None:
     assert isinstance(project, dict)
 
     core_names = {_package_name(dep) for dep in project["dependencies"]}
-    isolated_packages = {"giskard", "guardrails-ai", "playwright", "pytest-playwright"}
+    isolated_packages = {
+        "giskard",
+        "guardrails-ai",
+        "playwright",
+        "pytest-playwright",
+        "langfuse",
+        "langchain",
+    }
     assert core_names.isdisjoint(isolated_packages)
 
     extras = project["optional-dependencies"]
@@ -88,6 +95,13 @@ def test_optional_extras_are_isolated_from_core_dependencies() -> None:
     assert "giskard" in {_package_name(dep) for dep in extras["evals"]}
     assert "guardrails-ai" in {_package_name(dep) for dep in extras["guardrails"]}
     assert "playwright" in {_package_name(dep) for dep in extras["e2e"]}
+    # Sub-part 2.4.1a: the single tracing backend (and the langchain package its
+    # callback handler needs) stays isolated so OTel never breaks the core env.
+    observability_names = {_package_name(dep) for dep in extras["observability"]}
+    assert {"langfuse", "langchain"}.issubset(observability_names)
+    for dep in extras["observability"]:
+        assert ">=" in dep, f"Expected lower bound for {dep!r}"
+        assert "<" in dep, f"Expected upper bound for {dep!r}"
 
     dev_names = {_package_name(dep) for dep in extras["dev"]}
     assert {"ruff", "mypy", "pytest", "pytest-asyncio", "respx"}.issubset(dev_names)

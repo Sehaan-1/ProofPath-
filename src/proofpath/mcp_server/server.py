@@ -41,6 +41,7 @@ from proofpath.db.repositories.opportunity import OpportunityRepo
 from proofpath.db.repositories.tracker import TrackerRepo
 from proofpath.db.session import DatabaseSessionManager
 from proofpath.mcp_server import action_tools
+from proofpath.observability.tracing import shutdown_tracing
 from proofpath.policy.tool_allowlist import (
     ALL_TOOL_NAMES,
     FORBIDDEN_TOOL_NAMES,
@@ -306,12 +307,16 @@ def create_mcp_server(
     async def _lifespan(_server: MCPServer[MCPServerRuntime]) -> AsyncIterator[MCPServerRuntime]:
         active_settings = settings if settings is not None else get_settings()
         if session_factory is not None:
-            yield MCPServerRuntime(
-                settings=active_settings,
-                open_session=session_factory,
-                embedder=embedder,
-                session_maker=session_maker,
-            )
+            try:
+                yield MCPServerRuntime(
+                    settings=active_settings,
+                    open_session=session_factory,
+                    embedder=embedder,
+                    session_maker=session_maker,
+                )
+            finally:
+                # Approval resumes traced here flush on server shutdown too.
+                await shutdown_tracing()
             return
         db_manager = DatabaseSessionManager(active_settings.asyncpg_database_url)
         try:
@@ -323,6 +328,7 @@ def create_mcp_server(
             )
         finally:
             await db_manager.close()
+            await shutdown_tracing()
 
     @asynccontextmanager
     async def _active_runtime(

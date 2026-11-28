@@ -369,6 +369,7 @@ class _FakeWorkflow:
         self.request = request
         self.state = state
         self.resumed_with: list[object] = []
+        self.trace_id = "fake-unified-trace-id"
 
     async def apending_approval(self) -> ApprovalRequest | None:
         return self.request
@@ -474,9 +475,12 @@ def _harness(
             claims.append(target)
             return claimed
 
-        async def update_run_metrics(self, target: uuid.UUID, *, status: AnalysisRunStatus):
+        async def update_run_metrics(
+            self, target: uuid.UUID, *, status: AnalysisRunStatus, trace_id: str | None = None
+        ):
             statuses.append(status)
             run.status = status
+            run.trace_id = trace_id
             return run
 
     def build(**kwargs: Any) -> _FakeWorkflow:

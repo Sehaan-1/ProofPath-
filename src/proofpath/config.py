@@ -6,7 +6,15 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Any
 
-from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    Field,
+    PostgresDsn,
+    RedisDsn,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -123,7 +131,25 @@ class Settings(BaseSettings):
     # Safety & observability
     observability_backend: ObservabilityBackend = Field(
         default=ObservabilityBackend.NONE,
-        description="Active tracing backend: none, langfuse, or openllmetry.",
+        description=(
+            "Active tracing backend: none, langfuse, or openllmetry. The MVP wires "
+            "only Langfuse (Sub-part 2.4.1a); openllmetry fails closed if selected."
+        ),
+    )
+    langfuse_public_key: SecretStr | None = Field(
+        default=None,
+        description="Langfuse project public key; required when OBSERVABILITY_BACKEND=langfuse.",
+    )
+    langfuse_secret_key: SecretStr | None = Field(
+        default=None,
+        description="Langfuse project secret key (masked in logs/reprs).",
+    )
+    langfuse_host: AnyHttpUrl = Field(
+        default=AnyHttpUrl("https://cloud.langfuse.com"),
+        description=(
+            "Langfuse base URL (cloud or self-hosted). Trace payloads contain run "
+            "state, so use a trusted project."
+        ),
     )
     max_agent_retries: int = Field(
         default=2,
@@ -164,6 +190,8 @@ class Settings(BaseSettings):
         "github_token",
         "google_calendar_id",
         "google_calendar_access_token",
+        "langfuse_public_key",
+        "langfuse_secret_key",
         mode="before",
     )
     @classmethod
@@ -196,6 +224,17 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "LLM_API_KEY must be set when APP_ENV=production for hosted LLM providers."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_langfuse_opt_in(self) -> Settings:
+        if self.observability_backend is ObservabilityBackend.LANGFUSE and (
+            self.langfuse_public_key is None or self.langfuse_secret_key is None
+        ):
+            raise ValueError(
+                "OBSERVABILITY_BACKEND=langfuse requires LANGFUSE_PUBLIC_KEY and "
+                "LANGFUSE_SECRET_KEY."
             )
         return self
 
@@ -244,6 +283,17 @@ class Settings(BaseSettings):
         if self.github_token is None:
             raise ValueError("GITHUB_TOKEN is required for authenticated GitHub ingestion.")
         return self.github_token.get_secret_value()
+
+    def require_langfuse_keys(self) -> tuple[str, str]:
+        """Return the unwrapped Langfuse (public, secret) keys or fail clearly."""
+        if self.langfuse_public_key is None or self.langfuse_secret_key is None:
+            raise ValueError(
+                "LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are required for Langfuse tracing."
+            )
+        return (
+            self.langfuse_public_key.get_secret_value(),
+            self.langfuse_secret_key.get_secret_value(),
+        )
 
 
 @lru_cache(maxsize=1)

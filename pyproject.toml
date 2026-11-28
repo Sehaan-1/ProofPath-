@@ -47,6 +47,13 @@ evals = [
 guardrails = [
     "guardrails-ai>=0.11.0,<0.12.0",
 ]
+# Sub-part 2.4.1a: Langfuse is the single MVP tracing backend. Its v3 SDK is
+# OpenTelemetry-based, so it stays isolated from the core runtime; langchain is
+# required by the SDK's LangGraph/LangChain callback handler integration.
+observability = [
+    "langfuse>=3.15.0,<4.0.0",
+    "langchain>=1.5.2,<2.0.0",
+]
 e2e = [
     "playwright>=1.65.2,<2.0.0",
     "pytest-playwright>=0.10.0,<0.11.0",
@@ -129,6 +136,13 @@ pretty = true
 init_forbid_extra = true
 init_typed = true
 warn_required_dynamic_aliases = true
+
+# The observability extra is optional at type-check time too: core-only CI
+# environments do not install langfuse. When the extra IS installed, mypy still
+# uses its real (py.typed) types.
+[[tool.mypy.overrides]]
+module = ["langfuse.*"]
+ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
 # Pytest & pytest-asyncio

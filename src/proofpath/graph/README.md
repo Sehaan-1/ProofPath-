@@ -20,6 +20,34 @@ check, verdict upsert and draft writes share one transaction. Only a checked
 result gets `output_validated=True`. `tool_trace` records names only, and is
 independent of both the JD and any external observability backend.
 
+## Run tracing (Sub-slice 2.4.1)
+
+`build_workflow` resolves the single configured observability backend
+(`proofpath.observability.tracing`) and binds it to the run; a misconfigured
+backend fails closed at build time, before any node runs. Every `ainvoke`,
+`aresume`, and `astream` enters the tracer's invocation context, attaches its
+LangGraph callback handlers to the invocation config (caller callbacks are
+preserved), and flushes buffered spans afterwards — even when the invocation
+raises. The unified trace ID is `sha256(str(analysis_run_id))[:16].hex()`
+(`BoundedWorkflow.trace_id`), so rebuilding the graph for an approval resume,
+possibly in another process, joins the original trace. With
+`OBSERVABILITY_BACKEND=none` no callbacks are attached and no SDK is imported.
+The MVP backend is Langfuse (`proofpath[observability]` extra); OpenLLMetry is
+not wired.
+
+Span hierarchy (2.4.2a): the callback handler emits a parent `analysis_run`
+span with child node spans (`analyse_role`, `retrieve_evidence`,
+`compare_evidence`, `policy_verifier`, `approval_gate`, …). `wrap_node`
+annotates the `retrieve_evidence` span with retrieved chunk count and RRF
+similarity scores via `RunTracer.annotate_current_span`.
+
+Run metrics (2.4.2b): `wrap_node` also collects each node's LLM token usage
+(`proofpath.observability.usage`) onto `ProofPathState.llm_usage`, checkpointed
+across the approval pause. `execute_analysis_graph` sums it into `total_tokens`
+and an `estimated_cost_usd`, persisting both with `latency_ms` and the unified
+`trace_id` on `analysis_runs` (the trace id even on failure); the resume path
+records the same `trace_id`. `GET /api/v1/analyses/{run_id}` returns all four.
+
 A node failure is routed to `fallback_error` after its transaction rolls back.
 The result retains completed state, includes a sanitized `errors` entry, and
 omits unverified verdicts. The fallback attempts an independent

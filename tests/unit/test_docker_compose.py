@@ -194,3 +194,28 @@ def test_worker_service_database_url_uses_settings_credentials_and_db() -> None:
     assert f":-{parsed.username}" in db_url
     assert f":-{parsed.password}" in db_url
     assert f":-{db_name}" in db_url
+
+
+@pytest.mark.unit
+def test_worker_tracing_backend_is_opt_in_and_isolated() -> None:
+    """Sub-slice 2.4.1: Langfuse wiring is passthrough-only and off by default."""
+    compose = _load_compose()
+    worker = compose["services"]["worker"]
+
+    # The build arg defaults to none, so the default image installs no extra.
+    args = worker["build"]["args"]
+    assert args["OBSERVABILITY_BACKEND"] == "${OBSERVABILITY_BACKEND:-none}"
+
+    env = worker["environment"]
+    assert env["OBSERVABILITY_BACKEND"] == "${OBSERVABILITY_BACKEND:-none}"
+    # Keys stay blank by default and are never baked into the compose file.
+    assert env["LANGFUSE_PUBLIC_KEY"] == "${LANGFUSE_PUBLIC_KEY:-}"
+    assert env["LANGFUSE_SECRET_KEY"] == "${LANGFUSE_SECRET_KEY:-}"
+    assert env["LANGFUSE_HOST"] == "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+
+    # The Dockerfile installs the observability extra only for langfuse and
+    # keeps a bare `pip install .` path for the default lean image.
+    dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
+    assert "ARG OBSERVABILITY_BACKEND=none" in dockerfile
+    assert "observability" in dockerfile
+    assert "pip install ." in dockerfile
