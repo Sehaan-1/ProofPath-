@@ -296,3 +296,21 @@ def test_upload_size_limit(client, monkeypatch):
         data={"canonical_uri": "file:///note"},
     )
     assert response.status_code == 413
+
+
+def test_opportunity_creation_maps_missing_api_key_and_parse_error(client, monkeypatch):
+    test_client, _ = client
+    test_client.app.state.settings = Settings(_env_file=None, llm_api_key=None)
+    missing_key_res = test_client.post(
+        "/api/v1/opportunities", json={"raw_text": "Python engineer"}
+    )
+    assert missing_key_res.status_code == 503
+    assert missing_key_res.headers["content-type"] == "application/problem+json"
+
+    extractor = MagicMock()
+    extractor.analyse = AsyncMock(side_effect=routes.RoleParseError("provider failed"))
+    monkeypatch.setattr(routes, "create_role_parser", lambda _settings: object())
+    monkeypatch.setattr(routes, "AnalyseRoleExtractor", lambda _repo, _parser: extractor)
+    parse_err_res = test_client.post("/api/v1/opportunities", json={"raw_text": "Python engineer"})
+    assert parse_err_res.status_code == 502
+    assert parse_err_res.headers["content-type"] == "application/problem+json"

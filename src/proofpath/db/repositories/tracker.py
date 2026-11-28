@@ -34,14 +34,18 @@ class TrackerRepo:
             notes=notes,
             updated_at=now,
         )
-        upsert_stmt = insert_stmt.on_conflict_do_update(
-            index_elements=[ApplicationTracker.opportunity_id],
-            set_={
-                "stage": insert_stmt.excluded.stage,
-                "notes": insert_stmt.excluded.notes,
-                "updated_at": now,
-            },
-        ).returning(ApplicationTracker)
+        upsert_stmt = (
+            insert_stmt.on_conflict_do_update(
+                index_elements=[ApplicationTracker.opportunity_id],
+                set_={
+                    "stage": insert_stmt.excluded.stage,
+                    "notes": insert_stmt.excluded.notes,
+                    "updated_at": now,
+                },
+            )
+            .returning(ApplicationTracker)
+            .execution_options(populate_existing=True)
+        )
 
         result = await self._session.execute(upsert_stmt)
         await self._session.flush()

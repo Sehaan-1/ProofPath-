@@ -174,16 +174,20 @@ class AnalysisRepo:
             )
 
         insert_stmt = pg_insert(ClaimVerdict).values(rows)
-        upsert_stmt = insert_stmt.on_conflict_do_update(
-            index_elements=[ClaimVerdict.analysis_run_id, ClaimVerdict.requirement_id],
-            set_={
-                "verdict": insert_stmt.excluded.verdict,
-                "claim_summary": insert_stmt.excluded.claim_summary,
-                "cited_chunk_ids": insert_stmt.excluded.cited_chunk_ids,
-                "policy_downgraded": insert_stmt.excluded.policy_downgraded,
-                "gap_notes": insert_stmt.excluded.gap_notes,
-            },
-        ).returning(ClaimVerdict)
+        upsert_stmt = (
+            insert_stmt.on_conflict_do_update(
+                index_elements=[ClaimVerdict.analysis_run_id, ClaimVerdict.requirement_id],
+                set_={
+                    "verdict": insert_stmt.excluded.verdict,
+                    "claim_summary": insert_stmt.excluded.claim_summary,
+                    "cited_chunk_ids": insert_stmt.excluded.cited_chunk_ids,
+                    "policy_downgraded": insert_stmt.excluded.policy_downgraded,
+                    "gap_notes": insert_stmt.excluded.gap_notes,
+                },
+            )
+            .returning(ClaimVerdict)
+            .execution_options(populate_existing=True)
+        )
 
         result = await self._session.execute(upsert_stmt)
         await self._session.flush()
